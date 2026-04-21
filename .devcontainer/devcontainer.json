@@ -1,9 +1,6 @@
 {
   "name": "Temporal POC - Java",
-  "image": "mcr.microsoft.com/devcontainers/java:21",
-  "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker": {}
-  },
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
   "forwardPorts": [7233, 8080, 8233],
   "portsAttributes": {
     "7233": {
