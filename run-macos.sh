@@ -44,24 +44,29 @@ install_homebrew() {
   success "Homebrew $(brew --version | head -1)"
 }
 
-# ── SDKMAN ────────────────────────────────────────────────────────────────────
+# ── SDKMAN helpers ────────────────────────────────────────────────────────────
+# SDKMAN's init script references ZSH_VERSION without guarding it, which
+# triggers "unbound variable" under `set -u`. Disable -u around every source.
+sdkman_source() {
+  export SDKMAN_DIR="${HOME}/.sdkman"
+  set +u
+  # shellcheck disable=SC1091
+  source "${SDKMAN_DIR}/bin/sdkman-init.sh"
+  set -u
+}
+
 install_sdkman() {
   if [[ ! -f "${HOME}/.sdkman/bin/sdkman-init.sh" ]]; then
     info "Installing SDKMAN..."
     curl -s "https://get.sdkman.io" | bash
   fi
-  export SDKMAN_DIR="${HOME}/.sdkman"
-  # shellcheck disable=SC1091
-  source "${SDKMAN_DIR}/bin/sdkman-init.sh"
+  sdkman_source
   success "SDKMAN $(sdk version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 }
 
 # ── Java 21 via SDKMAN ────────────────────────────────────────────────────────
 install_java() {
-  export SDKMAN_DIR="${HOME}/.sdkman"
-  # shellcheck disable=SC1091
-  source "${SDKMAN_DIR}/bin/sdkman-init.sh"
-
+  sdkman_source
   if ! sdk list java 2>/dev/null | grep -q "${JAVA_VERSION}.*installed\|${JAVA_VERSION}.*current"; then
     info "Installing Java ${JAVA_VERSION} (Temurin) via SDKMAN..."
     sdk install java "${JAVA_VERSION}" < /dev/null
@@ -72,10 +77,7 @@ install_java() {
 
 # ── Maven via SDKMAN ──────────────────────────────────────────────────────────
 install_maven() {
-  export SDKMAN_DIR="${HOME}/.sdkman"
-  # shellcheck disable=SC1091
-  source "${SDKMAN_DIR}/bin/sdkman-init.sh"
-
+  sdkman_source
   if ! command -v mvn &>/dev/null; then
     info "Installing Maven via SDKMAN..."
     sdk install maven < /dev/null
@@ -218,7 +220,7 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 install_homebrew
-install_sdkman
+install_sdkman   # also calls sdkman_source, making sdk/java available
 install_java
 install_maven
 install_colima_docker
