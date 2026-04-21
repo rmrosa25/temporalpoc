@@ -181,12 +181,19 @@ start_docker_stack() {
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 build_if_needed() {
+  local needs_build=false
   if [[ ! -f "$JAR" ]]; then
-    info "JAR not found — building project..."
+    needs_build=true
+  elif find src -name "*.java" -newer "$JAR" | grep -q .; then
+    info "Source files changed — rebuilding..."
+    needs_build=true
+  fi
+
+  if [[ "$needs_build" == "true" ]]; then
     mvn package -q -DskipTests
     success "Build complete → $JAR"
   else
-    info "JAR already built. Run 'mvn package -q -DskipTests' to rebuild."
+    info "JAR is up to date."
   fi
 }
 
