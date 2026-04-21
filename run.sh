@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
-# Starts the Temporal dev server, the order worker, and optionally runs a test workflow.
+# Temporal Order Processing POC — Linux/Gitpod runner
 #
 # Usage:
-#   ./run.sh              — start server + worker (happy path test)
-#   ./run.sh --fail       — start server + worker (payment failure / saga compensation test)
-#   ./run.sh --stop       — stop all background processes
-#   ./run.sh --status     — show what is currently running
+#   ./run.sh           — install deps, start server, run all 4 test scenarios
+#   ./run.sh --stop    — stop server and any running worker
+#   ./run.sh --status  — show running processes and log paths
 #
-# Requirements: Java 21+, Maven, Temporal CLI
-# Install missing deps: sudo apt-get install -y openjdk-21-jdk-headless maven
-#                       curl -sSf https://temporal.download/cli.sh | sh
+# Dependencies installed automatically: Java 21, Maven, Temporal CLI
 
 set -euo pipefail
 
-TEMPORAL_CLI_VERSION="1.6.2"       # https://github.com/temporalio/cli/releases
+# ── Config ────────────────────────────────────────────────────────────────────
+TEMPORAL_CLI_VERSION="1.6.2"
 TEMPORAL_BIN="${HOME}/.temporalio/bin/temporal"
 JAR="target/temporal-order-poc-1.0-SNAPSHOT.jar"
 TEMPORAL_PORT=7233
@@ -21,30 +19,28 @@ UI_PORT=8080
 SERVER_LOG="/tmp/temporal-server.log"
 WORKER_LOG="/tmp/temporal-worker.log"
 
-# ── Colours ──────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
+BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Dependency installation ───────────────────────────────────────────────────
 check_deps() {
-  # Java
   java -version &>/dev/null || {
     info "Installing Java 21..."
     sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless
   }
   success "Java $(java -version 2>&1 | head -1)"
 
-  # Maven
   mvn -version &>/dev/null || {
     info "Installing Maven..."
     sudo apt-get install -y --no-install-recommends maven
   }
   success "Maven $(mvn -version 2>&1 | head -1)"
 
-  # Temporal CLI
   local installed_ver=""
   [[ -x "$TEMPORAL_BIN" ]] && installed_ver=$("$TEMPORAL_BIN" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
   if [[ "$installed_ver" != "$TEMPORAL_CLI_VERSION" ]]; then
@@ -61,32 +57,72 @@ build_if_needed() {
     mvn package -q -DskipTests
     success "Build complete"
   else
-    info "JAR already built, skipping Maven build (run 'mvn package -q -DskipTests' to rebuild)"
+    info "JAR already built. Run 'mvn package -q -DskipTests' to rebuild."
   fi
 }
 
 wait_for_port() {
-  local port=$1 label=$2 attempts=0 max=30
+  local port=$1 label=$2 attempts=0 max=40
   info "Waiting for $label on port $port..."
   until curl -sf "http://localhost:${port}" &>/dev/null; do
     ((attempts++))
-    [[ $attempts -ge $max ]] && error "$label did not start within ${max}s. Check log: $SERVER_LOG"
+    [[ $attempts -ge $max ]] && error "$label did not start within ${max}s. Check: $SERVER_LOG"
     sleep 1
   done
   success "$label is ready"
 }
 
+# ── Worker lifecycle ──────────────────────────────────────────────────────────
+start_worker() {
+  local mode="${1:-NONE}"
+  pkill -f "com.example.order.Worker" 2>/dev/null || true
+  sleep 1
+  info "Starting worker with FAILURE_MODE=${mode}..."
+  nohup env FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.Worker \
+    > "$WORKER_LOG" 2>&1 &
+  sleep 3
+  grep -q "Worker started" "$WORKER_LOG" \
+    || error "Worker failed to start (FAILURE_MODE=${mode}). Check: $WORKER_LOG"
+  success "Worker started | FAILURE_MODE=${mode}"
+}
+
+stop_worker() {
+  pkill -f "com.example.order.Worker" 2>/dev/null || true
+  sleep 1
+}
+
+# ── Temporal server ───────────────────────────────────────────────────────────
+ensure_server() {
+  if curl -sf "http://localhost:${UI_PORT}" &>/dev/null; then
+    success "Temporal server already running | UI → http://localhost:${UI_PORT}"
+  else
+    pkill -f "temporal server start-dev" 2>/dev/null || true
+    sleep 1
+    info "Starting Temporal dev server (gRPC :${TEMPORAL_PORT}, UI :${UI_PORT})..."
+    nohup "$TEMPORAL_BIN" server start-dev \
+      --port "$TEMPORAL_PORT" \
+      --ui-port "$UI_PORT" \
+      > "$SERVER_LOG" 2>&1 &
+    wait_for_port "$UI_PORT" "Temporal UI"
+    success "Temporal server started | UI → http://localhost:${UI_PORT}"
+  fi
+}
+
+# ── Stop / Status ─────────────────────────────────────────────────────────────
 stop_all() {
-  info "Stopping Temporal server and worker..."
-  pkill -f "temporal server start-dev" 2>/dev/null && success "Temporal server stopped" || warn "Temporal server was not running"
   pkill -f "com.example.order.Worker"  2>/dev/null && success "Worker stopped"          || warn "Worker was not running"
+  pkill -f "temporal server start-dev" 2>/dev/null && success "Temporal server stopped" || warn "Temporal server was not running"
 }
 
 show_status() {
   echo ""
   echo -e "${CYAN}=== Process Status ===${NC}"
-  pgrep -a -f "temporal server start-dev" && echo -e "${GREEN}  Temporal server: RUNNING${NC}" || echo -e "${RED}  Temporal server: STOPPED${NC}"
-  pgrep -a -f "com.example.order.Worker"  && echo -e "${GREEN}  Worker:          RUNNING${NC}" || echo -e "${RED}  Worker:          STOPPED${NC}"
+  pgrep -f "temporal server start-dev" &>/dev/null \
+    && echo -e "  ${GREEN}Temporal server: RUNNING${NC} (PID $(pgrep -f 'temporal server start-dev'))" \
+    || echo -e "  ${RED}Temporal server: STOPPED${NC}"
+  pgrep -f "com.example.order.Worker" &>/dev/null \
+    && echo -e "  ${GREEN}Worker: RUNNING${NC} (PID $(pgrep -f 'com.example.order.Worker'))" \
+    || echo -e "  ${RED}Worker: STOPPED${NC}"
   echo ""
   echo -e "${CYAN}=== Logs ===${NC}"
   echo "  Server: $SERVER_LOG"
@@ -94,72 +130,59 @@ show_status() {
   echo ""
 }
 
+# ── Run one scenario group ────────────────────────────────────────────────────
+# Restarts the worker with the given FAILURE_MODE, runs TestRunner, captures exit code.
+SUITE_FAILURES=0
+run_scenario_group() {
+  local mode="$1"
+  echo ""
+  echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BOLD}${YELLOW}  Worker mode: FAILURE_MODE=${mode}${NC}"
+  echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  start_worker "$mode"
+  FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.TestRunner || ((SUITE_FAILURES++))
+  stop_worker
+}
+
 # ── Argument handling ─────────────────────────────────────────────────────────
-FAIL_PAYMENT=false
 case "${1:-}" in
   --stop)   stop_all;    exit 0 ;;
   --status) show_status; exit 0 ;;
-  --fail)   FAIL_PAYMENT=true ;;
   "")       ;;
-  *) echo "Usage: $0 [--fail | --stop | --status]"; exit 1 ;;
+  *) echo "Usage: $0 [--stop | --status]"; exit 1 ;;
 esac
 
-# ── Main flow ─────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   Temporal Order Processing POC          ║${NC}"
-echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
+echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}${BOLD}║   Temporal Order Processing POC          ║${NC}"
+echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
 check_deps
 build_if_needed
+ensure_server
 
-# Start Temporal dev server (skip if already running)
-if curl -sf "http://localhost:${UI_PORT}" &>/dev/null; then
-  TEMPORAL_PID=$(pgrep -f "temporal server start-dev" || echo "unknown")
-  success "Temporal server already running (PID=${TEMPORAL_PID}) | UI → http://localhost:${UI_PORT}"
+# Run all 4 scenario groups, one per FAILURE_MODE
+run_scenario_group "NONE"
+run_scenario_group "INVALID_ORDER"
+run_scenario_group "PAYMENT_FAILURE"
+run_scenario_group "SHIPPING_FAILURE"
+
+stop_worker
+
+echo ""
+echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${CYAN}  Suite Summary${NC}"
+echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+if [[ "$SUITE_FAILURES" -eq 0 ]]; then
+  echo -e "  ${GREEN}${BOLD}All 4 scenarios passed.${NC}"
 else
-  pkill -f "temporal server start-dev" 2>/dev/null || true
-  sleep 1
-  info "Starting Temporal dev server (port ${TEMPORAL_PORT}, UI port ${UI_PORT})..."
-  nohup "$TEMPORAL_BIN" server start-dev \
-    --port "$TEMPORAL_PORT" \
-    --ui-port "$UI_PORT" \
-    > "$SERVER_LOG" 2>&1 &
-  TEMPORAL_PID=$!
-  wait_for_port "$UI_PORT" "Temporal UI"
-  success "Temporal server PID=${TEMPORAL_PID} | UI → http://localhost:${UI_PORT}"
+  echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed. Check worker logs: ${WORKER_LOG}${NC}"
 fi
-
-# Always restart worker to pick up FAIL_PAYMENT flag
-pkill -f "com.example.order.Worker" 2>/dev/null || true
-sleep 1
-
-# Start worker
-info "Starting Order Worker..."
-if [[ "$FAIL_PAYMENT" == "true" ]]; then
-  warn "FAIL_AT_PAYMENT=true — payment will fail, saga compensation will run"
-  nohup env FAIL_AT_PAYMENT=true java -cp "$JAR" com.example.order.Worker > "$WORKER_LOG" 2>&1 &
-else
-  nohup java -cp "$JAR" com.example.order.Worker > "$WORKER_LOG" 2>&1 &
-fi
-WORKER_PID=$!
-sleep 3
-grep -q "Worker started" "$WORKER_LOG" || error "Worker failed to start. Check: $WORKER_LOG"
-success "Worker PID=${WORKER_PID} | polling task queue: order-processing"
-
-# Run a test workflow
 echo ""
-echo -e "${CYAN}=== Running test workflow ===${NC}"
-java -cp "$JAR" com.example.order.Starter
-
-echo ""
-echo -e "${CYAN}=== Worker activity log ===${NC}"
-grep -E "Validating|Reserving|Charging|Shipping|Sending|COMPENSATION|ERROR" "$WORKER_LOG" | tail -20
-
-echo ""
-success "Done. Server and worker are still running in the background."
 echo -e "  Temporal UI  → ${GREEN}http://localhost:${UI_PORT}${NC}"
-echo -e "  Stop all     → ${YELLOW}./run.sh --stop${NC}"
+echo -e "  Stop server  → ${YELLOW}./run.sh --stop${NC}"
 echo -e "  Status       → ${YELLOW}./run.sh --status${NC}"
 echo ""
+exit "$SUITE_FAILURES"

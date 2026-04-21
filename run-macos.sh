@@ -2,10 +2,9 @@
 # Temporal Order Processing POC — macOS runner
 #
 # Usage:
-#   ./run-macos.sh              — install deps, start stack, run happy path test
-#   ./run-macos.sh --fail       — same but payment fails → saga compensation runs
-#   ./run-macos.sh --stop       — stop worker + Docker stack + Colima
-#   ./run-macos.sh --status     — show running processes and log paths
+#   ./run-macos.sh           — install deps, start stack, run all 4 test scenarios
+#   ./run-macos.sh --stop    — stop worker + Docker stack + Colima
+#   ./run-macos.sh --status  — show running processes and log paths
 #
 # Dependencies installed automatically:
 #   Homebrew, SDKMAN, Java 21 (via SDKMAN), Maven (via SDKMAN),
@@ -24,7 +23,8 @@ COLIMA_CPUS=2
 COLIMA_MEMORY=4   # GiB — Temporal + Postgres need ~2 GiB
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
+BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -229,22 +229,52 @@ show_status() {
   echo ""
 }
 
+# ── Worker lifecycle ──────────────────────────────────────────────────────────
+start_worker() {
+  local mode="${1:-NONE}"
+  pkill -f "com.example.order.Worker" 2>/dev/null || true
+  sleep 1
+  info "Starting worker with FAILURE_MODE=${mode}..."
+  nohup env FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.Worker \
+    > "$WORKER_LOG" 2>&1 &
+  sleep 3
+  grep -q "Worker started" "$WORKER_LOG" \
+    || error "Worker failed to start (FAILURE_MODE=${mode}). Check: $WORKER_LOG"
+  success "Worker started | FAILURE_MODE=${mode}"
+}
+
+stop_worker() {
+  pkill -f "com.example.order.Worker" 2>/dev/null || true
+  sleep 1
+}
+
+# ── Run one scenario group ────────────────────────────────────────────────────
+SUITE_FAILURES=0
+run_scenario_group() {
+  local mode="$1"
+  echo ""
+  echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BOLD}${YELLOW}  Worker mode: FAILURE_MODE=${mode}${NC}"
+  echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  start_worker "$mode"
+  FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.TestRunner || ((SUITE_FAILURES++))
+  stop_worker
+}
+
 # ── Argument handling ─────────────────────────────────────────────────────────
-FAIL_PAYMENT=false
 case "${1:-}" in
   --stop)   stop_all;    exit 0 ;;
   --status) show_status; exit 0 ;;
-  --fail)   FAIL_PAYMENT=true ;;
   "")       ;;
-  *) echo "Usage: $0 [--fail | --stop | --status]"; exit 1 ;;
+  *) echo "Usage: $0 [--stop | --status]"; exit 1 ;;
 esac
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   Temporal Order Processing POC          ║${NC}"
-echo -e "${CYAN}║   macOS  ·  Colima  ·  SDKMAN            ║${NC}"
-echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
+echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}${BOLD}║   Temporal Order Processing POC          ║${NC}"
+echo -e "${CYAN}${BOLD}║   macOS  ·  Colima  ·  SDKMAN            ║${NC}"
+echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
 install_homebrew
@@ -259,35 +289,26 @@ export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
 start_docker_stack
 build_if_needed
 
-# Always restart worker to pick up FAIL_PAYMENT flag
-pkill -f "com.example.order.Worker" 2>/dev/null || true
-sleep 1
+# Run all 4 scenario groups, one per FAILURE_MODE
+run_scenario_group "NONE"
+run_scenario_group "INVALID_ORDER"
+run_scenario_group "PAYMENT_FAILURE"
+run_scenario_group "SHIPPING_FAILURE"
 
-info "Starting Order Worker..."
-if [[ "$FAIL_PAYMENT" == "true" ]]; then
-  warn "FAIL_AT_PAYMENT=true — payment will fail, saga compensation will run"
-  nohup env FAIL_AT_PAYMENT=true java -cp "$JAR" com.example.order.Worker \
-    > "$WORKER_LOG" 2>&1 &
+stop_worker
+
+echo ""
+echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${CYAN}  Suite Summary${NC}"
+echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+if [[ "$SUITE_FAILURES" -eq 0 ]]; then
+  echo -e "  ${GREEN}${BOLD}All 4 scenarios passed.${NC}"
 else
-  nohup java -cp "$JAR" com.example.order.Worker \
-    > "$WORKER_LOG" 2>&1 &
+  echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed. Check worker logs: ${WORKER_LOG}${NC}"
 fi
-sleep 3
-grep -q "Worker started" "$WORKER_LOG" || error "Worker failed to start. Check: $WORKER_LOG"
-success "Worker started | polling task queue: order-processing"
-
-# Run test workflow
 echo ""
-echo -e "${CYAN}=== Running test workflow ===${NC}"
-java -cp "$JAR" com.example.order.Starter
-
-echo ""
-echo -e "${CYAN}=== Worker activity log ===${NC}"
-grep -E "Validating|Reserving|Charging|Shipping|Sending|COMPENSATION|ERROR" "$WORKER_LOG" | tail -20
-
-echo ""
-success "Done. Stack and worker are still running in the background."
 echo -e "  Temporal UI  → ${GREEN}http://localhost:${UI_PORT}${NC}"
 echo -e "  Stop all     → ${YELLOW}./run-macos.sh --stop${NC}"
 echo -e "  Status       → ${YELLOW}./run-macos.sh --status${NC}"
 echo ""
+exit "$SUITE_FAILURES"
