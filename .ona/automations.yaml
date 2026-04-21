@@ -4,26 +4,15 @@ tasks:
     description: Install JDK 21, Maven, and Docker Engine into the base Ubuntu image.
     command: |
       set -e
-
-      # Java 21
       if ! java -version 2>/dev/null; then
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless
+        sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless maven
       fi
-
-      # Maven
-      if ! mvn -version 2>/dev/null; then
-        sudo apt-get install -y --no-install-recommends maven
+      if ! temporal --version 2>/dev/null; then
+        curl -sSf https://temporal.download/cli.sh | sh
+        echo 'export PATH="$PATH:/home/vscode/.temporalio/bin"' >> ~/.bashrc
       fi
-
-      # Docker
-      if ! docker info 2>/dev/null; then
-        curl -fsSL https://get.docker.com | sudo sh
-        sudo usermod -aG docker $(whoami)
-        sudo service docker start
-      fi
-
-      java -version && mvn -version && docker info | grep "Server Version"
+      java -version && mvn -version && temporal --version
     triggeredBy:
       - postDevcontainerStart
 
@@ -39,13 +28,11 @@ tasks:
 services:
   temporal-stack:
     name: Temporal Stack
-    description: Starts PostgreSQL, Temporal server, and Temporal Web UI via Docker Compose.
+    description: Starts Temporal dev server (in-process, no Docker required).
     commands:
-      start: |
-        sudo service docker start || true
-        docker compose up -d
+      start: /home/vscode/.temporalio/bin/temporal server start-dev --port 7233 --ui-port 8080 --headless=false
       ready: curl -sf http://localhost:8080
-      stop: docker compose down
+      stop: pkill -f "temporal server start-dev" || true
 
   worker:
     name: Order Worker
@@ -56,5 +43,5 @@ services:
           echo "Waiting for Temporal..."
           sleep 2
         done
-        java -cp target/temporal-order-poc-1.0-SNAPSHOT.jar com.example.order.Worker
-      stop: kill $(lsof -t -i:7233) 2>/dev/null || true
+        java -cp /workspaces/temporalpoc/target/temporal-order-poc-1.0-SNAPSHOT.jar com.example.order.Worker
+      stop: pkill -f "com.example.order.Worker" || true
