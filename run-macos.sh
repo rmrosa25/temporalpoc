@@ -296,11 +296,13 @@ export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
 start_docker_stack
 build_if_needed
 
-# Run all 4 scenario groups, one per FAILURE_MODE
+# Run all 6 scenario groups, one per FAILURE_MODE
 run_scenario_group "NONE"
 run_scenario_group "INVALID_ORDER"
 run_scenario_group "PAYMENT_FAILURE"
 run_scenario_group "SHIPPING_FAILURE"
+run_scenario_group "PARENT_CHILD"
+run_scenario_group "BATCH"
 
 stop_worker
 
@@ -309,7 +311,7 @@ echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━
 echo -e "${BOLD}${CYAN}  Suite Summary${NC}"
 echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 if [[ "$SUITE_FAILURES" -eq 0 ]]; then
-  echo -e "  ${GREEN}${BOLD}All 4 scenarios passed.${NC}"
+  echo -e "  ${GREEN}${BOLD}All 6 scenarios passed.${NC}"
 else
   echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed. Check worker logs: ${WORKER_LOG}${NC}"
 fi

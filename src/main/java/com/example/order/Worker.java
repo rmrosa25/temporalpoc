@@ -1,6 +1,8 @@
 package com.example.order;
 
 import com.example.order.activity.OrderActivitiesImpl;
+import com.example.order.workflow.BatchOrderWorkflowImpl;
+import com.example.order.workflow.FulfillmentWorkflowImpl;
 import com.example.order.workflow.OrderWorkflowImpl;
 import io.temporal.client.WorkflowClient;
 import io.temporal.serviceclient.WorkflowServiceStubs;
@@ -10,8 +12,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Registers the workflow and activity implementations with Temporal
- * and starts polling the "order-processing" task queue.
+ * Registers all workflow and activity implementations and starts polling
+ * the "order-processing" task queue.
+ *
+ * Registered workflows:
+ *   - OrderWorkflow        — single order pipeline (saga pattern)
+ *   - FulfillmentWorkflow  — parent/child: primary + secondary order
+ *   - BatchOrderWorkflow   — fan-out: N parallel child OrderWorkflows
  */
 public class Worker {
 
@@ -32,7 +39,11 @@ public class Worker {
         WorkerFactory factory = WorkerFactory.newInstance(client);
 
         io.temporal.worker.Worker worker = factory.newWorker(TASK_QUEUE);
-        worker.registerWorkflowImplementationTypes(OrderWorkflowImpl.class);
+        worker.registerWorkflowImplementationTypes(
+                OrderWorkflowImpl.class,
+                FulfillmentWorkflowImpl.class,
+                BatchOrderWorkflowImpl.class
+        );
         worker.registerActivitiesImplementations(new OrderActivitiesImpl());
 
         log.info("Worker started. Polling task queue: {}", TASK_QUEUE);
