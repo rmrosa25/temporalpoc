@@ -93,10 +93,6 @@ echo ""
 check_deps
 build_if_needed
 
-# Stop any stale worker (always restart to pick up FAIL_PAYMENT flag)
-pkill -f "com.example.order.Worker" 2>/dev/null || true
-sleep 1
-
 # Start Temporal dev server (skip if already running)
 if curl -sf "http://localhost:${UI_PORT}" &>/dev/null; then
   TEMPORAL_PID=$(pgrep -f "temporal server start-dev" || echo "unknown")
@@ -113,6 +109,10 @@ else
   wait_for_port "$UI_PORT" "Temporal UI"
   success "Temporal server PID=${TEMPORAL_PID} | UI → http://localhost:${UI_PORT}"
 fi
+
+# Always restart worker to pick up FAIL_PAYMENT flag
+pkill -f "com.example.order.Worker" 2>/dev/null || true
+sleep 1
 
 # Start worker
 info "Starting Order Worker..."
