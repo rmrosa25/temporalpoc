@@ -13,6 +13,7 @@
 
 set -euo pipefail
 
+TEMPORAL_CLI_VERSION="1.6.2"       # https://github.com/temporalio/cli/releases
 TEMPORAL_BIN="${HOME}/.temporalio/bin/temporal"
 JAR="target/temporal-order-poc-1.0-SNAPSHOT.jar"
 TEMPORAL_PORT=7233
@@ -29,9 +30,29 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 check_deps() {
-  java -version &>/dev/null  || error "Java not found. Run: sudo apt-get install -y openjdk-21-jdk-headless"
-  mvn  -version &>/dev/null  || error "Maven not found. Run: sudo apt-get install -y maven"
-  [[ -x "$TEMPORAL_BIN" ]]   || error "Temporal CLI not found. Run: curl -sSf https://temporal.download/cli.sh | sh"
+  # Java
+  java -version &>/dev/null || {
+    info "Installing Java 21..."
+    sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless
+  }
+  success "Java $(java -version 2>&1 | head -1)"
+
+  # Maven
+  mvn -version &>/dev/null || {
+    info "Installing Maven..."
+    sudo apt-get install -y --no-install-recommends maven
+  }
+  success "Maven $(mvn -version 2>&1 | head -1)"
+
+  # Temporal CLI
+  local installed_ver=""
+  [[ -x "$TEMPORAL_BIN" ]] && installed_ver=$("$TEMPORAL_BIN" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [[ "$installed_ver" != "$TEMPORAL_CLI_VERSION" ]]; then
+    info "Installing Temporal CLI v${TEMPORAL_CLI_VERSION}..."
+    curl -sSf https://temporal.download/cli.sh | TEMPORAL_CLI_VERSION="$TEMPORAL_CLI_VERSION" sh
+    export PATH="${HOME}/.temporalio/bin:$PATH"
+  fi
+  success "Temporal CLI $("$TEMPORAL_BIN" --version 2>&1 | head -1)"
 }
 
 build_if_needed() {

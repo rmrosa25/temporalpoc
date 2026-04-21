@@ -15,6 +15,7 @@ set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 JAVA_VERSION="21.0.5-tem"          # Temurin 21 via SDKMAN
+TEMPORAL_CLI_VERSION="1.6.2"       # https://github.com/temporalio/cli/releases
 JAR="target/temporal-order-poc-1.0-SNAPSHOT.jar"
 TEMPORAL_PORT=7233
 UI_PORT=8080
@@ -120,9 +121,26 @@ install_colima_docker() {
 
 # ── Temporal CLI ──────────────────────────────────────────────────────────────
 install_temporal_cli() {
-  if ! command -v temporal &>/dev/null; then
-    info "Installing Temporal CLI via Homebrew..."
+  local installed_ver=""
+  if command -v temporal &>/dev/null; then
+    installed_ver=$(temporal --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  fi
+
+  if [[ "$installed_ver" != "$TEMPORAL_CLI_VERSION" ]]; then
+    info "Installing Temporal CLI v${TEMPORAL_CLI_VERSION} via Homebrew..."
+    # Unlink any existing version first to avoid conflicts
+    brew unlink temporal 2>/dev/null || true
     brew install temporal
+    # If brew ships a different version, fall back to the official install script
+    local brew_ver
+    brew_ver=$(temporal --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ "$brew_ver" != "$TEMPORAL_CLI_VERSION" ]]; then
+      warn "Homebrew has v${brew_ver}, installing v${TEMPORAL_CLI_VERSION} via install script..."
+      curl -sSf https://temporal.download/cli.sh | TEMPORAL_CLI_VERSION="$TEMPORAL_CLI_VERSION" sh
+      export PATH="${HOME}/.temporalio/bin:$PATH"
+      grep -q ".temporalio/bin" "${HOME}/.zshrc" 2>/dev/null || \
+        echo 'export PATH="${HOME}/.temporalio/bin:$PATH"' >> "${HOME}/.zshrc"
+    fi
   fi
   success "Temporal CLI $(temporal --version 2>&1 | head -1)"
 }
