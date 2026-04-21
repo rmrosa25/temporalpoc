@@ -1,0 +1,22 @@
+{
+  "name": "Temporal POC - Java",
+  "image": "mcr.microsoft.com/devcontainers/java:21",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker": {}
+  },
+  "forwardPorts": [7233, 8080, 8233],
+  "portsAttributes": {
+    "7233": {
+      "label": "Temporal gRPC",
+      "onAutoForward": "silent"
+    },
+    "8080": {
+      "label": "Temporal Web UI",
+      "onAutoForward": "openBrowserOnce"
+    },
+    "8233": {
+      "label": "Temporal Metrics",
+      "onAutoForward": "silent"
+    }
+  }
+}

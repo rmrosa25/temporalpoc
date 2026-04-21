@@ -1,0 +1,28 @@
+tasks:
+  build:
+    name: Build
+    description: Compile and package the project.
+    command: mvn package -q -DskipTests
+    triggeredBy:
+      - postDevcontainerStart
+
+services:
+  temporal-stack:
+    name: Temporal Stack
+    description: Starts PostgreSQL, Temporal server, and Temporal Web UI via Docker Compose.
+    commands:
+      start: docker compose up -d
+      ready: curl -sf http://localhost:8080
+      stop: docker compose down
+
+  worker:
+    name: Order Worker
+    description: Temporal worker polling the order-processing task queue.
+    commands:
+      start: |
+        until curl -sf http://localhost:8080 > /dev/null 2>&1; do
+          echo "Waiting for Temporal..."
+          sleep 2
+        done
+        java -cp target/temporal-order-poc-1.0-SNAPSHOT.jar com.example.order.Worker
+      stop: kill $(lsof -t -i:7233) 2>/dev/null || true
