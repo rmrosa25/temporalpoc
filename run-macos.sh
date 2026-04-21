@@ -45,13 +45,18 @@ install_homebrew() {
 }
 
 # ── SDKMAN helpers ────────────────────────────────────────────────────────────
-# SDKMAN's init script references ZSH_VERSION without guarding it, which
-# triggers "unbound variable" under `set -u`. Disable -u around every source.
-sdkman_source() {
+# SDKMAN's scripts use unguarded variables (ZSH_VERSION, SDKMAN_OFFLINE_MODE,
+# etc.) throughout — not just in the init script. Keep -u disabled for the
+# entire SDKMAN session and restore it only after all sdk commands finish.
+sdkman_init() {
   export SDKMAN_DIR="${HOME}/.sdkman"
   set +u
   # shellcheck disable=SC1091
   source "${SDKMAN_DIR}/bin/sdkman-init.sh"
+  # -u stays off; caller must call sdkman_done when finished
+}
+
+sdkman_done() {
   set -u
 }
 
@@ -60,28 +65,33 @@ install_sdkman() {
     info "Installing SDKMAN..."
     curl -s "https://get.sdkman.io" | bash
   fi
-  sdkman_source
-  success "SDKMAN $(sdk version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  sdkman_init
+  local ver
+  ver=$(sdk version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  sdkman_done
+  success "SDKMAN ${ver}"
 }
 
 # ── Java 21 via SDKMAN ────────────────────────────────────────────────────────
 install_java() {
-  sdkman_source
+  sdkman_init
   if ! sdk list java 2>/dev/null | grep -q "${JAVA_VERSION}.*installed\|${JAVA_VERSION}.*current"; then
     info "Installing Java ${JAVA_VERSION} (Temurin) via SDKMAN..."
     sdk install java "${JAVA_VERSION}" < /dev/null
   fi
   sdk use java "${JAVA_VERSION}" < /dev/null
+  sdkman_done
   success "Java $(java -version 2>&1 | head -1)"
 }
 
 # ── Maven via SDKMAN ──────────────────────────────────────────────────────────
 install_maven() {
-  sdkman_source
+  sdkman_init
   if ! command -v mvn &>/dev/null; then
     info "Installing Maven via SDKMAN..."
     sdk install maven < /dev/null
   fi
+  sdkman_done
   success "Maven $(mvn -version 2>&1 | head -1)"
 }
 
