@@ -1,4 +1,4 @@
-package com.example.order;
+package com.example;
 
 import com.example.order.activity.OrderActivitiesImpl;
 import com.example.order.model.BatchResult;
@@ -11,7 +11,6 @@ import com.example.order.workflow.FulfillmentWorkflow;
 import com.example.order.workflow.FulfillmentWorkflowImpl;
 import com.example.order.workflow.OrderWorkflow;
 import com.example.order.workflow.OrderWorkflowImpl;
-import com.example.provisioning.activity.CspChangeActivities;
 import com.example.provisioning.activity.CspChangeActivitiesImpl;
 import com.example.provisioning.kafka.HlrBusFactory;
 import com.example.provisioning.kafka.HlrConfirmationDispatcher;
