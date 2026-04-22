@@ -18,9 +18,11 @@ TEMPORAL_CLI_VERSION="1.6.2"       # https://github.com/temporalio/cli/releases
 JAR="target/temporal-order-poc-1.0-SNAPSHOT.jar"
 TEMPORAL_PORT=7233
 UI_PORT=8080
+KAFKA_PORT=9092
+KAFKA_BOOTSTRAP="localhost:${KAFKA_PORT}"
 WORKER_LOG="/tmp/temporal-worker.log"
 COLIMA_CPUS=2
-COLIMA_MEMORY=4   # GiB — Temporal + Postgres need ~2 GiB
+COLIMA_MEMORY=4   # GiB — Temporal + Postgres + Kafka need ~3 GiB
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
@@ -177,6 +179,15 @@ start_docker_stack() {
     sleep 2
   done
   success "Temporal stack ready | UI → http://localhost:${UI_PORT}"
+
+  info "Waiting for Kafka on port ${KAFKA_PORT}..."
+  attempts=0
+  until (echo > /dev/tcp/localhost/${KAFKA_PORT}) &>/dev/null; do
+    ((attempts++))
+    [[ $attempts -ge $max ]] && error "Kafka did not start within ${max}s. Run: docker compose logs kafka"
+    sleep 2
+  done
+  success "Kafka ready | bootstrap=localhost:${KAFKA_PORT}"
 }
 
 # ── Build ─────────────────────────────────────────────────────────────────────
@@ -243,7 +254,10 @@ start_worker() {
   pkill -f "com.example.order.Worker" 2>/dev/null || true
   sleep 1
   info "Starting worker with FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}..."
-  nohup env FAILURE_MODE="$mode" PROVISIONING_FAIL_AT="$prov_fail" \
+  nohup env \
+    FAILURE_MODE="$mode" \
+    PROVISIONING_FAIL_AT="$prov_fail" \
+    KAFKA_BOOTSTRAP_SERVERS="$KAFKA_BOOTSTRAP" \
     java -cp "$JAR" com.example.order.Worker > "$WORKER_LOG" 2>&1 &
   sleep 3
   grep -q "Worker started" "$WORKER_LOG" \
@@ -266,7 +280,8 @@ run_scenario_group() {
   echo -e "${BOLD}${YELLOW}  Worker mode: FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}${NC}"
   echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   start_worker "$mode" "$prov_fail"
-  FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.TestRunner || ((SUITE_FAILURES++))
+  FAILURE_MODE="$mode" KAFKA_BOOTSTRAP_SERVERS="$KAFKA_BOOTSTRAP" \
+    java -cp "$JAR" com.example.order.TestRunner || ((SUITE_FAILURES++))
   stop_worker
 }
 

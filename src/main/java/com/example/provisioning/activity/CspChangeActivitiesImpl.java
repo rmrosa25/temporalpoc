@@ -1,22 +1,27 @@
 package com.example.provisioning.activity;
 
+import com.example.provisioning.kafka.HlrBus;
+import com.example.provisioning.kafka.HlrBusFactory;
+import com.example.provisioning.kafka.HlrCommandMessage;
 import com.example.provisioning.model.CspChangeRequest;
 import io.temporal.activity.Activity;
+import io.temporal.activity.ActivityExecutionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.UUID;
 
 /**
- * Stub implementations that simulate real integration behaviour.
+ * Activity implementations for the CSP change provisioning pipeline.
+ *
+ * publishHlrCommand writes to the {@link HlrBus} — either real Kafka or
+ * the in-process bus, depending on environment configuration.
  *
  * Failure injection via PROVISIONING_FAIL_AT env var:
- *   VALIDATE        → validateRequest throws (SIM not found / invalid CSP)
- *   LOCK            → lockSim throws (concurrent change already in progress)
- *   HLR_PUBLISH     → publishHlrCommand throws (Kafka broker unavailable)
- *   HLR_ERROR       → HLR returns an error in its confirmation (injected via signal)
- *   HLR_TIMEOUT     → no signal arrives within the workflow timeout window
- *   INVENTORY       → updateSimInventory throws (DB write failure)
+ *   VALIDATE     → validateRequest throws
+ *   LOCK         → lockSim throws
+ *   HLR_PUBLISH  → publishHlrCommand throws (before bus write)
+ *   INVENTORY    → updateSimInventory throws
  */
 public class CspChangeActivitiesImpl implements CspChangeActivities {
 
@@ -67,18 +72,32 @@ public class CspChangeActivitiesImpl implements CspChangeActivities {
 
     @Override
     public String publishHlrCommand(CspChangeRequest request) {
-        log.info("[{}] Publishing HLR command to Kafka: iccid={}, targetCsp={}",
+        log.info("[{}] Publishing HLR command: iccid={}, targetCsp={}",
                 request.getCorrelationId(), request.getIccid(), request.getTargetCsp());
-        sleep(400);
 
         if ("HLR_PUBLISH".equals(FAIL_AT)) {
             throw Activity.wrap(new RuntimeException(
-                    "Kafka broker unavailable: failed to publish HLR command for " +
-                    request.getIccid()));
+                    "Bus unavailable: failed to publish HLR command for " + request.getIccid()));
         }
 
+        ActivityExecutionContext ctx = Activity.getExecutionContext();
+        String workflowId = ctx.getInfo().getWorkflowId();
+
+        HlrCommandMessage message = new HlrCommandMessage(
+                request.getCorrelationId(),
+                workflowId,
+                request.getIccid(),
+                request.getMsisdn(),
+                request.getTargetCsp(),
+                request.getRequestedBy()
+        );
+
+        HlrBus bus = HlrBusFactory.get();
+        long offset = bus.publishCommand(message);
+
         String commandId = "HLR-CMD-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-        log.info("[{}] HLR command published: commandId={}", request.getCorrelationId(), commandId);
+        log.info("[{}] HLR command published: commandId={}, offset={}",
+                request.getCorrelationId(), commandId, offset);
         return commandId;
     }
 

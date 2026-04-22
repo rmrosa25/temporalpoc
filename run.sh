@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
-# Temporal Order Processing POC — Linux/Gitpod runner
+# Temporal Order Processing POC — Linux / Gitpod runner
+#
+# Uses Temporal CLI dev server (no Docker required).
+# Each scenario runs in a single JVM (ScenarioRunner) that starts the
+# Temporal worker and the test together, sharing an in-process message bus.
 #
 # Usage:
-#   ./run.sh           — install deps, start server, run all 4 test scenarios
-#   ./run.sh --stop    — stop server and any running worker
-#   ./run.sh --status  — show running processes and log paths
-#
-# Dependencies installed automatically: Java 21, Maven, Temporal CLI
+#   ./run.sh           — build and run all 10 scenarios
+#   ./run.sh --stop    — stop Temporal dev server
+#   ./run.sh --status  — show running processes
 
 set -euo pipefail
 
-# ── Config ────────────────────────────────────────────────────────────────────
 TEMPORAL_CLI_VERSION="1.6.2"
 TEMPORAL_BIN="${HOME}/.temporalio/bin/temporal"
 JAR="target/temporal-order-poc-1.0-SNAPSHOT.jar"
 TEMPORAL_PORT=7233
-UI_PORT=8080
-SERVER_LOG="/tmp/temporal-server.log"
-WORKER_LOG="/tmp/temporal-worker.log"
+UI_PORT=8233
+TEMPORAL_LOG="/tmp/temporal-server.log"
 
-# ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
 BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
@@ -27,165 +26,128 @@ success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# ── Dependency installation ───────────────────────────────────────────────────
 check_deps() {
   java -version &>/dev/null || {
     info "Installing Java 21..."
     sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless
   }
-  success "Java $(java -version 2>&1 | head -1)"
+  success "Java $(java -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 
   mvn -version &>/dev/null || {
     info "Installing Maven..."
     sudo apt-get install -y --no-install-recommends maven
   }
-  success "Maven $(mvn -version 2>&1 | head -1)"
+  success "Maven $(mvn -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 
   local installed_ver=""
   [[ -x "$TEMPORAL_BIN" ]] && installed_ver=$("$TEMPORAL_BIN" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
   if [[ "$installed_ver" != "$TEMPORAL_CLI_VERSION" ]]; then
     info "Installing Temporal CLI v${TEMPORAL_CLI_VERSION}..."
     curl -sSf https://temporal.download/cli.sh | TEMPORAL_CLI_VERSION="$TEMPORAL_CLI_VERSION" sh
-    export PATH="${HOME}/.temporalio/bin:$PATH"
   fi
-  success "Temporal CLI $("$TEMPORAL_BIN" --version 2>&1 | head -1)"
+  export PATH="${HOME}/.temporalio/bin:$PATH"
+  success "Temporal CLI $("$TEMPORAL_BIN" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 }
 
 build_if_needed() {
   local needs_build=false
-  if [[ ! -f "$JAR" ]]; then
-    needs_build=true
-  elif find src -name "*.java" -newer "$JAR" | grep -q .; then
-    info "Source files changed — rebuilding..."
-    needs_build=true
-  fi
-
+  [[ ! -f "$JAR" ]] && needs_build=true
+  find src -name "*.java" -newer "$JAR" 2>/dev/null | grep -q . && needs_build=true
   if [[ "$needs_build" == "true" ]]; then
+    info "Building..."
     mvn package -q -DskipTests
-    success "Build complete"
+    success "Build complete → $(du -sh "$JAR" | cut -f1) JAR"
   else
     info "JAR is up to date."
   fi
 }
 
-wait_for_port() {
-  local port=$1 label=$2 attempts=0 max=40
-  info "Waiting for $label on port $port..."
-  until curl -sf "http://localhost:${port}" &>/dev/null; do
+start_temporal() {
+  export PATH="${HOME}/.temporalio/bin:$PATH"
+  if nc -z localhost "$TEMPORAL_PORT" 2>/dev/null; then
+    success "Temporal dev server already running on :${TEMPORAL_PORT}"
+    return
+  fi
+  info "Starting Temporal dev server (port=${TEMPORAL_PORT}, UI=${UI_PORT})..."
+  "$TEMPORAL_BIN" server start-dev \
+    --port "$TEMPORAL_PORT" \
+    --ui-port "$UI_PORT" \
+    --headless \
+    > "$TEMPORAL_LOG" 2>&1 &
+  local attempts=0
+  until nc -z localhost "$TEMPORAL_PORT" 2>/dev/null; do
     ((attempts++))
-    [[ $attempts -ge $max ]] && error "$label did not start within ${max}s. Check: $SERVER_LOG"
+    [[ $attempts -ge 30 ]] && error "Temporal dev server did not start. Check: $TEMPORAL_LOG"
     sleep 1
   done
-  success "$label is ready"
+  success "Temporal dev server ready | UI → http://localhost:${UI_PORT}"
 }
 
-# ── Worker lifecycle ──────────────────────────────────────────────────────────
-start_worker() {
-  local mode="${1:-NONE}"
-  local prov_fail="${2:-NONE}"
-  pkill -f "com.example.order.Worker" 2>/dev/null || true
+stop_temporal() {
+  pkill -f "temporal server start-dev" 2>/dev/null || true
   sleep 1
-  info "Starting worker with FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}..."
-  nohup env FAILURE_MODE="$mode" PROVISIONING_FAIL_AT="$prov_fail" \
-    java -cp "$JAR" com.example.order.Worker > "$WORKER_LOG" 2>&1 &
-  sleep 3
-  grep -q "Worker started" "$WORKER_LOG" \
-    || error "Worker failed to start. Check: $WORKER_LOG"
-  success "Worker started | FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}"
-}
-
-stop_worker() {
-  pkill -f "com.example.order.Worker" 2>/dev/null || true
-  sleep 1
-}
-
-# ── Temporal server ───────────────────────────────────────────────────────────
-ensure_server() {
-  if curl -sf "http://localhost:${UI_PORT}" &>/dev/null; then
-    success "Temporal server already running | UI → http://localhost:${UI_PORT}"
-  else
-    pkill -f "temporal server start-dev" 2>/dev/null || true
-    sleep 1
-    info "Starting Temporal dev server (gRPC :${TEMPORAL_PORT}, UI :${UI_PORT})..."
-    nohup "$TEMPORAL_BIN" server start-dev \
-      --port "$TEMPORAL_PORT" \
-      --ui-port "$UI_PORT" \
-      > "$SERVER_LOG" 2>&1 &
-    wait_for_port "$UI_PORT" "Temporal UI"
-    success "Temporal server started | UI → http://localhost:${UI_PORT}"
-  fi
-}
-
-# ── Stop / Status ─────────────────────────────────────────────────────────────
-stop_all() {
-  pkill -f "com.example.order.Worker"  2>/dev/null && success "Worker stopped"          || warn "Worker was not running"
-  pkill -f "temporal server start-dev" 2>/dev/null && success "Temporal server stopped" || warn "Temporal server was not running"
+  success "Temporal dev server stopped"
 }
 
 show_status() {
   echo ""
-  echo -e "${CYAN}=== Process Status ===${NC}"
+  echo -e "${CYAN}=== Temporal dev server ===${NC}"
   pgrep -f "temporal server start-dev" &>/dev/null \
-    && echo -e "  ${GREEN}Temporal server: RUNNING${NC} (PID $(pgrep -f 'temporal server start-dev'))" \
-    || echo -e "  ${RED}Temporal server: STOPPED${NC}"
-  pgrep -f "com.example.order.Worker" &>/dev/null \
-    && echo -e "  ${GREEN}Worker: RUNNING${NC} (PID $(pgrep -f 'com.example.order.Worker'))" \
-    || echo -e "  ${RED}Worker: STOPPED${NC}"
+    && echo -e "  ${GREEN}RUNNING${NC} (PID $(pgrep -f 'temporal server start-dev'))" \
+    || echo -e "  ${RED}STOPPED${NC}"
   echo ""
   echo -e "${CYAN}=== Logs ===${NC}"
-  echo "  Server: $SERVER_LOG"
-  echo "  Worker: $WORKER_LOG"
+  echo "  Temporal: $TEMPORAL_LOG"
   echo ""
 }
 
-# ── Run one scenario group ────────────────────────────────────────────────────
-# $1 = FAILURE_MODE   $2 = PROVISIONING_FAIL_AT (optional, default NONE)
 SUITE_FAILURES=0
-run_scenario_group() {
-  local mode="$1"
-  local prov_fail="${2:-NONE}"
+run_scenario() {
+  local mode="$1" prov_fail="${2:-NONE}"
   echo ""
   echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${BOLD}${YELLOW}  Worker mode: FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}${NC}"
+  echo -e "${BOLD}${YELLOW}  FAILURE_MODE=${mode}  PROVISIONING_FAIL_AT=${prov_fail}${NC}"
   echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  start_worker "$mode" "$prov_fail"
-  FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.TestRunner || ((SUITE_FAILURES++))
-  stop_worker
+
+  local log_file="/tmp/scenario-${mode}.log"
+  if FAILURE_MODE="$mode" PROVISIONING_FAIL_AT="$prov_fail" \
+       java -cp "$JAR" com.example.order.ScenarioRunner > "$log_file" 2>&1; then
+    success "PASS — ${mode}"
+  else
+    warn "FAIL — ${mode} (log: ${log_file})"
+    tail -20 "$log_file"
+    ((SUITE_FAILURES++))
+  fi
 }
 
-# ── Argument handling ─────────────────────────────────────────────────────────
 case "${1:-}" in
-  --stop)   stop_all;    exit 0 ;;
-  --status) show_status; exit 0 ;;
+  --stop)   stop_temporal; exit 0 ;;
+  --status) show_status;   exit 0 ;;
   "")       ;;
   *) echo "Usage: $0 [--stop | --status]"; exit 1 ;;
 esac
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}${BOLD}║   Temporal Order Processing POC          ║${NC}"
+echo -e "${CYAN}${BOLD}║   Linux · Temporal CLI · In-Process Bus  ║${NC}"
 echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
 check_deps
 build_if_needed
-ensure_server
+start_temporal
 
-# Run all 10 scenario groups
-run_scenario_group "NONE"
-run_scenario_group "INVALID_ORDER"
-run_scenario_group "PAYMENT_FAILURE"
-run_scenario_group "SHIPPING_FAILURE"
-run_scenario_group "PARENT_CHILD"
-run_scenario_group "BATCH"
-# CSP change provisioning scenarios — worker uses PROVISIONING_FAIL_AT
-run_scenario_group "CSP_HAPPY_PATH"
-run_scenario_group "CSP_VALIDATE_FAIL" "VALIDATE"
-run_scenario_group "CSP_HLR_ERROR"
-run_scenario_group "CSP_HLR_TIMEOUT"
-
-stop_worker
+run_scenario "NONE"
+run_scenario "INVALID_ORDER"
+run_scenario "PAYMENT_FAILURE"
+run_scenario "SHIPPING_FAILURE"
+run_scenario "PARENT_CHILD"
+run_scenario "BATCH"
+run_scenario "CSP_HAPPY_PATH"
+run_scenario "CSP_VALIDATE_FAIL" "VALIDATE"
+run_scenario "CSP_HLR_ERROR"
+run_scenario "CSP_HLR_TIMEOUT"
 
 echo ""
 echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -194,11 +156,11 @@ echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━
 if [[ "$SUITE_FAILURES" -eq 0 ]]; then
   echo -e "  ${GREEN}${BOLD}All 10 scenarios passed.${NC}"
 else
-  echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed. Check worker logs: ${WORKER_LOG}${NC}"
+  echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed.${NC}"
+  echo -e "  Scenario logs: ${YELLOW}/tmp/scenario-*.log${NC}"
 fi
 echo ""
-echo -e "  Temporal UI  → ${GREEN}http://localhost:${UI_PORT}${NC}"
-echo -e "  Stop server  → ${YELLOW}./run.sh --stop${NC}"
-echo -e "  Status       → ${YELLOW}./run.sh --status${NC}"
+echo -e "  Temporal UI → ${GREEN}http://localhost:${UI_PORT}${NC}"
+echo -e "  Stop server → ${YELLOW}./run.sh --stop${NC}"
 echo ""
 exit "$SUITE_FAILURES"

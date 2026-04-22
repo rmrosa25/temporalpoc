@@ -5,6 +5,8 @@ import com.example.order.workflow.BatchOrderWorkflowImpl;
 import com.example.order.workflow.FulfillmentWorkflowImpl;
 import com.example.order.workflow.OrderWorkflowImpl;
 import com.example.provisioning.activity.CspChangeActivitiesImpl;
+import com.example.provisioning.kafka.HlrBusFactory;
+import com.example.provisioning.kafka.HlrConfirmationDispatcher;
 import com.example.provisioning.workflow.CspChangeWorkflowImpl;
 import io.temporal.client.WorkflowClient;
 import io.temporal.serviceclient.WorkflowServiceStubs;
@@ -17,11 +19,15 @@ import org.slf4j.LoggerFactory;
  * Registers all workflow and activity implementations and starts polling
  * the "order-processing" task queue.
  *
+ * Also starts the HlrConfirmationDispatcher in a background thread.
+ * The dispatcher reads from the HlrBus (Kafka or in-process) and delivers
+ * each confirmation as a Temporal signal to the corresponding CspChangeWorkflow.
+ *
  * Registered workflows:
  *   - OrderWorkflow        — single order pipeline (saga pattern)
  *   - FulfillmentWorkflow  — parent/child: primary + secondary order
  *   - BatchOrderWorkflow   — fan-out: N parallel child OrderWorkflows
- *   - CspChangeWorkflow    — network provisioning: signal-driven HLR change
+ *   - CspChangeWorkflow    — network provisioning: bus + signal-driven HLR change
  */
 public class Worker {
 
@@ -52,6 +58,23 @@ public class Worker {
                 new OrderActivitiesImpl(),
                 new CspChangeActivitiesImpl()
         );
+
+        // Start HLR confirmation dispatcher in a background daemon thread.
+        // It polls the bus and signals the waiting CspChangeWorkflow.
+        HlrConfirmationDispatcher dispatcher = new HlrConfirmationDispatcher(
+                HlrBusFactory.get(), client);
+        Thread dispatcherThread = new Thread(dispatcher, "hlr-confirmation-dispatcher");
+        dispatcherThread.setDaemon(true);
+        dispatcherThread.start();
+        log.info("HlrConfirmationDispatcher started on background thread");
+
+        // Shutdown hook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutting down...");
+            dispatcher.close();
+            factory.shutdown();
+            HlrBusFactory.close();
+        }));
 
         log.info("Worker started. Polling task queue: {}", TASK_QUEUE);
         factory.start();

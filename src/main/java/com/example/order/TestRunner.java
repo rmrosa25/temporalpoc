@@ -7,9 +7,10 @@ import com.example.order.model.OrderResult;
 import com.example.order.workflow.BatchOrderWorkflow;
 import com.example.order.workflow.FulfillmentWorkflow;
 import com.example.order.workflow.OrderWorkflow;
+import com.example.provisioning.kafka.HlrBusFactory;
+import com.example.provisioning.kafka.KafkaSimulator;
 import com.example.provisioning.model.CspChangeRequest;
 import com.example.provisioning.model.CspChangeResult;
-import com.example.provisioning.model.HlrConfirmation;
 import com.example.provisioning.workflow.CspChangeWorkflow;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowOptions;
@@ -22,6 +23,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Runs one test scenario per invocation, selected by FAILURE_MODE env var.
@@ -37,10 +40,10 @@ import java.util.concurrent.CompletableFuture;
  *   BATCH            → BatchOrderWorkflow fanning out 10 parallel children
  *
  * CSP change provisioning:
- *   CSP_HAPPY_PATH   → full success, HLR confirms via signal
- *   CSP_VALIDATE_FAIL→ validation rejects before lock acquired
- *   CSP_HLR_ERROR    → HLR returns error via signal, saga unlocks SIM
- *   CSP_HLR_TIMEOUT  → no signal arrives, saga unlocks SIM
+ *   CSP_HAPPY_PATH    → full success, HLR confirms via bus signal
+ *   CSP_VALIDATE_FAIL → validation rejects before lock acquired
+ *   CSP_HLR_ERROR     → HLR returns error via signal, saga unlocks SIM
+ *   CSP_HLR_TIMEOUT   → no signal arrives, saga unlocks SIM
  *
  * Exits 0 on pass, 1 on fail.
  */
@@ -59,6 +62,12 @@ public class TestRunner {
         String temporalHost = System.getenv().getOrDefault("TEMPORAL_HOST", "localhost:7233");
         FailureMode mode = FailureMode.valueOf(
                 System.getenv().getOrDefault("FAILURE_MODE", "NONE").toUpperCase());
+
+        // Initialise the bus before connecting to Temporal so it's ready
+        // when KafkaSimulator and the Worker's dispatcher both call HlrBusFactory.get().
+        // For CSP scenarios the TestRunner and Worker share the same JVM, so the
+        // singleton InProcessHlrBus is shared automatically.
+        HlrBusFactory.get();
 
         WorkflowServiceStubs service = WorkflowServiceStubs.newServiceStubs(
                 WorkflowServiceStubsOptions.newBuilder().setTarget(temporalHost).build()
@@ -130,8 +139,6 @@ public class TestRunner {
         printScenarioHeader(label, desc, "both children COMPLETED");
 
         log.info("Parent workflow ID: {}", parentId);
-        log.info("  Child 1 → {}/primary   orderId={}", parentId, primary.getOrderId());
-        log.info("  Child 2 → {}/secondary orderId={}", parentId, secondary.getOrderId());
 
         WorkflowOptions opts = WorkflowOptions.newBuilder()
                 .setWorkflowId(parentId)
@@ -220,11 +227,10 @@ public class TestRunner {
                 "operator-portal"
         );
 
-        String label       = cspLabelFor(mode);
-        String description = cspDescriptionFor(mode);
-        String expected    = (mode == FailureMode.CSP_HAPPY_PATH) ? "COMPLETED" : "FAILED or TIMED_OUT";
+        String label    = cspLabelFor(mode);
+        String expected = (mode == FailureMode.CSP_HAPPY_PATH) ? "COMPLETED" : "FAILED or TIMED_OUT";
 
-        printScenarioHeader(label, description, expected);
+        printScenarioHeader(label, cspDescriptionFor(mode), expected);
         log.info("correlationId={}, iccid={}, {}→{}",
                 request.getCorrelationId(), request.getIccid(),
                 request.getCurrentCsp(), request.getTargetCsp());
@@ -236,8 +242,7 @@ public class TestRunner {
 
         CspChangeWorkflow wfStub = client.newWorkflowStub(CspChangeWorkflow.class, opts);
 
-        // CSP_VALIDATE_FAIL: workflow will fail synchronously in the activity —
-        // no signal needed, just call synchronously.
+        // CSP_VALIDATE_FAIL: activity throws synchronously — no bus involved.
         if (mode == FailureMode.CSP_VALIDATE_FAIL) {
             CspChangeResult result = wfStub.changeCsp(request);
             boolean pass = result.getStatus() == CspChangeResult.Status.FAILED;
@@ -245,47 +250,33 @@ public class TestRunner {
             return pass;
         }
 
-        // CSP_HLR_TIMEOUT: start workflow and send NO signal — let it time out.
-        // The workflow timeout is 30s; we just wait for it to return.
+        // CSP_HLR_TIMEOUT: simulator consumes the command but publishes nothing.
         if (mode == FailureMode.CSP_HLR_TIMEOUT) {
-            log.info("No HLR signal will be sent — waiting for workflow timeout...");
+            log.info("[KafkaSimulator] TIMEOUT mode — will consume command but not respond");
+            KafkaSimulator simulator = new KafkaSimulator(KafkaSimulator.Mode.TIMEOUT, 500);
+            ExecutorService exec = Executors.newSingleThreadExecutor();
+            exec.submit(simulator);
+
             CspChangeResult result = wfStub.changeCsp(request);
+            simulator.close();
+            exec.shutdownNow();
+
             boolean pass = result.getStatus() == CspChangeResult.Status.TIMED_OUT;
             logCspResult(pass, label, result);
             return pass;
         }
 
-        // CSP_HAPPY_PATH / CSP_HLR_ERROR:
-        // Start workflow asynchronously, then send the signal from a background thread.
+        // CSP_HAPPY_PATH / CSP_HLR_ERROR: start simulator, then workflow async.
+        KafkaSimulator.Mode simMode = (mode == FailureMode.CSP_HAPPY_PATH)
+                ? KafkaSimulator.Mode.SUCCESS
+                : KafkaSimulator.Mode.ERROR;
+
+        log.info("[KafkaSimulator] Starting in {} mode", simMode);
+        KafkaSimulator simulator = new KafkaSimulator(simMode, 1500);
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        exec.submit(simulator);
+
         CompletableFuture<CspChangeResult> future = WorkflowClient.execute(wfStub::changeCsp, request);
-
-        // Send the signal after a short delay (simulates Kafka consumer latency)
-        Thread signalThread = new Thread(() -> {
-            try {
-                Thread.sleep(2000); // simulate HLR processing time
-                CspChangeWorkflow signalStub = client.newWorkflowStub(
-                        CspChangeWorkflow.class, correlationId);
-
-                if (mode == FailureMode.CSP_HAPPY_PATH) {
-                    HlrConfirmation confirmation = HlrConfirmation.ok(
-                            correlationId, request.getTargetCsp());
-                    log.info("[signal-sender] Sending HLR success confirmation: {}", confirmation);
-                    signalStub.hlrConfirmationReceived(confirmation);
-                } else { // CSP_HLR_ERROR
-                    HlrConfirmation confirmation = HlrConfirmation.error(
-                            correlationId, "HLR_PROFILE_REJECTED",
-                            "Target CSP PROFILE_DATA_ROAMING not provisioned for this IMSI");
-                    log.info("[signal-sender] Sending HLR error confirmation: {}", confirmation);
-                    signalStub.hlrConfirmationReceived(confirmation);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (Exception e) {
-                log.error("[signal-sender] Failed to send signal: {}", e.getMessage());
-            }
-        });
-        signalThread.setDaemon(true);
-        signalThread.start();
 
         try {
             CspChangeResult result = future.get();
@@ -297,6 +288,9 @@ public class TestRunner {
         } catch (Exception e) {
             log.error("{}{}[FAIL]{} {} → exception: {}", BOLD, RED, RESET, label, e.getMessage());
             return false;
+        } finally {
+            simulator.close();
+            exec.shutdownNow();
         }
     }
 
@@ -329,7 +323,7 @@ public class TestRunner {
                        "   receive HLR success signal → update SIM Inventory.";
             case CSP_VALIDATE_FAIL:
                 return "Validation rejects the request (SIM not found / CSP mismatch).\n" +
-                       "   No lock acquired, no Kafka message published.";
+                       "   No lock acquired, no bus message published.";
             case CSP_HLR_ERROR:
                 return "HLR returns an explicit error via signal after command is published.\n" +
                        "   Saga compensates: unlocks SIM. Inventory not updated.";
