@@ -1,29 +1,23 @@
 package com.example.provisioning.kafka;
 
 /**
- * Abstraction over the provisioning command/confirmation message channel.
+ * Message channel for provisioning commands and element confirmations.
  *
- * Two implementations:
- *   - KafkaHlrBus     — real Kafka (used when KAFKA_BOOTSTRAP_SERVERS is set)
- *   - InProcessHlrBus — BlockingQueue (used when no external Kafka is available)
- *
- * Flow:
- *   publishCommand(ProvisioningCommandMessage)   → provisioning-commands topic
- *   pollCommand()                                ← consumed by ProvisioningSimulator
- *   publishConfirmation(ElementConfirmationMessage) → provisioning-confirmations topic
- *   pollConfirmation()                           ← consumed by HlrConfirmationDispatcher
- *                                                   → signals CspChangeWorkflow
+ * Current implementation: {@link InProcessHlrBus} (in-memory, single JVM).
+ * In production this would be backed by Kafka topics:
+ *   provisioning-commands      ← one ProvisioningCommandMessage per NetworkElement
+ *   provisioning-confirmations ← one ElementConfirmationMessage per NetworkElement
  */
 public interface HlrBus {
 
     /**
      * Publishes a provisioning command for one network element.
-     * Returns an opaque offset/sequence number for logging.
+     * Returns an opaque sequence number for logging.
      */
     long publishCommand(ProvisioningCommandMessage message);
 
     /**
-     * Publishes a confirmation from a network element (used by ProvisioningSimulator).
+     * Publishes a confirmation from a network element (used by KafkaSimulator).
      */
     void publishConfirmation(ElementConfirmationMessage message);
 
