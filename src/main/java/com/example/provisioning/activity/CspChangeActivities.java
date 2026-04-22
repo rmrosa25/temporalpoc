@@ -1,61 +1,84 @@
 package com.example.provisioning.activity;
 
 import com.example.provisioning.model.CspChangeRequest;
+import com.example.provisioning.model.ProvisioningPlan;
 import io.temporal.activity.ActivityInterface;
 import io.temporal.activity.ActivityMethod;
 
 /**
  * Activities for the CSP change provisioning pipeline.
  *
- * Each method represents one integration point. In production:
- *   - validateRequest    → queries SIM Inventory DB + business rules engine
- *   - lockSim            → writes a lock record to SIM Inventory DB
- *   - unlockSim          → removes the lock record (saga compensation)
- *   - publishHlrCommand  → produces a message to a Kafka topic consumed by the HLR gateway
- *   - updateSimInventory → writes the final CSP state to SIM Inventory DB
+ * Sync activities call domain microservice APIs (HTTP/gRPC).
+ * The async activity publishes to Kafka and returns immediately —
+ * the workflow waits for confirmation signals.
  *
- * All implementations here are stubs that simulate latency and log intent.
+ * Pipeline:
+ *   validate            → Validation Service API (sync)
+ *   lockSim             → SIM Inventory Service API (sync)
+ *   decompose           → Decomposition Service API (sync)
+ *                         returns ProvisioningPlan: which HLR/MSC/SGSN/… to hit
+ *   provisioningCommand → Kafka publish per NetworkElement (async)
+ *                         workflow awaits one ElementConfirmation signal per element
+ *   updateSimInventory  → SIM Inventory Service API (sync, also clears the lock)
+ *
+ * Saga compensation:
+ *   rollbackLock → SIM Inventory Service API, called if any step after lockSim fails
  */
 @ActivityInterface
 public interface CspChangeActivities {
 
     /**
-     * Validates that the CSP change can be processed:
-     *   - SIM exists and is active
-     *   - currentCsp matches what is recorded in inventory
-     *   - targetCsp is a valid profile code
-     *   - no conflicting change is already in progress
+     * Calls the Validation Service to verify:
+     *   - SIM exists and is active in inventory
+     *   - currentCsp matches the recorded profile
+     *   - targetCsp is a valid, reachable profile code
+     *   - no concurrent change is already in progress for this ICCID
+     *
+     * Throws on any validation failure. No compensation needed (no state written).
      */
     @ActivityMethod
-    void validateRequest(CspChangeRequest request);
+    void validate(CspChangeRequest request);
 
     /**
-     * Marks the SIM as locked for change in SIM Inventory.
-     * Prevents concurrent provisioning operations on the same ICCID.
-     * Returns a lock token used for unlocking.
+     * Calls the SIM Inventory Service to mark the SIM as change-in-progress.
+     * Prevents concurrent provisioning on the same ICCID.
+     * Returns a lock token used for rollback.
      */
     @ActivityMethod
     String lockSim(CspChangeRequest request);
 
     /**
-     * Releases the SIM lock. Called as saga compensation if any
-     * subsequent step fails after the lock was acquired.
+     * Calls the Decomposition Service to determine which network elements
+     * (HLR, MSC, SGSN, GGSN, HSS) require a provisioning command for this
+     * CSP change, and which profile to apply on each.
+     *
+     * Returns a ProvisioningPlan with one NetworkElement per target system.
      */
     @ActivityMethod
-    void unlockSim(String lockToken);
+    ProvisioningPlan decompose(CspChangeRequest request);
 
     /**
-     * Publishes a CSP change command to the HLR Kafka topic.
-     * The HLR gateway consumes this message and applies the profile change
-     * in the network. Returns the command message ID for correlation.
+     * Publishes one provisioning command to Kafka per NetworkElement in the plan.
+     * Each message is keyed by ICCID+elementId for per-element ordering.
+     *
+     * Returns immediately after publishing — does NOT wait for network responses.
+     * The workflow awaits one ElementConfirmation signal per element.
      */
     @ActivityMethod
-    String publishHlrCommand(CspChangeRequest request);
+    void provisioningCommand(ProvisioningPlan plan);
 
     /**
-     * Updates SIM Inventory with the final applied CSP after HLR confirms success.
-     * Also clears the lock and records the change audit trail.
+     * Calls the SIM Inventory Service to persist the final applied CSP,
+     * record the audit trail, and release the lock.
+     * Only called after all element confirmations succeed.
      */
     @ActivityMethod
     void updateSimInventory(CspChangeRequest request, String appliedCsp);
+
+    /**
+     * Calls the SIM Inventory Service to roll back the lock acquired by lockSim.
+     * Saga compensation — called if any step after lockSim fails.
+     */
+    @ActivityMethod
+    void rollbackLock(String lockToken);
 }

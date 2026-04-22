@@ -6,17 +6,19 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Simulates the HLR gateway in test scenarios.
+ * Simulates network element adapters in test scenarios.
  *
- * Reads HLR commands from the bus, waits a configurable delay, then publishes
- * a response. The response type is controlled by {@link Mode}:
+ * Reads ProvisioningCommandMessages from the bus (one per NetworkElement),
+ * waits a configurable delay, then publishes an ElementConfirmationMessage
+ * for each. The response type is controlled by {@link Mode}:
  *
- *   SUCCESS (default) → publishes a success confirmation
- *   ERROR             → publishes an error confirmation
- *   TIMEOUT           → consumes the command but publishes nothing
+ *   SUCCESS → all elements confirm success
+ *   ERROR   → all elements return an error
+ *   TIMEOUT → commands are consumed but no confirmations published
+ *             (workflow times out waiting for signals)
  *
- * Works with both {@link InProcessHlrBus} and {@link KafkaHlrBus}.
- * In production this role is played by the real HLR gateway system.
+ * In production each network element has its own adapter that consumes
+ * commands and publishes confirmations independently.
  */
 public class KafkaSimulator implements Runnable, AutoCloseable {
 
@@ -29,12 +31,11 @@ public class KafkaSimulator implements Runnable, AutoCloseable {
     private final HlrBus bus;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    /** Uses the shared bus from {@link HlrBusFactory}. */
     public KafkaSimulator(Mode mode, long delayMs) {
         this.mode = mode;
         this.delayMs = delayMs;
         this.bus = HlrBusFactory.get();
-        log.info("KafkaSimulator initialized: mode={}, delayMs={}", mode, delayMs);
+        log.info("ProvisioningSimulator initialized: mode={}, delayMs={}", mode, delayMs);
     }
 
     @Override
@@ -42,7 +43,7 @@ public class KafkaSimulator implements Runnable, AutoCloseable {
         log.info("[Simulator] Started in {} mode", mode);
         try {
             while (running.get()) {
-                HlrCommandMessage command = bus.pollCommand(500);
+                ProvisioningCommandMessage command = bus.pollCommand(500);
                 if (command != null) {
                     handleCommand(command);
                 }
@@ -51,38 +52,42 @@ public class KafkaSimulator implements Runnable, AutoCloseable {
             Thread.currentThread().interrupt();
         } catch (Exception e) {
             if (running.get()) {
-                log.error("[Simulator] Error in simulator loop", e);
+                log.error("[Simulator] Error in loop", e);
             }
         }
         log.info("[Simulator] Stopped");
     }
 
-    private void handleCommand(HlrCommandMessage command) throws InterruptedException {
-        log.info("[Simulator] Received HLR command: correlationId={}, iccid={}",
-                command.getCorrelationId(), command.getIccid());
+    private void handleCommand(ProvisioningCommandMessage command) throws InterruptedException {
+        log.info("[Simulator] Received command: correlationId={}, elementId={}, type={}",
+                command.getCorrelationId(), command.getElementId(), command.getElementType());
 
         Thread.sleep(delayMs);
 
         if (mode == Mode.TIMEOUT) {
-            log.warn("[Simulator] TIMEOUT mode — not publishing confirmation for correlationId={}",
-                    command.getCorrelationId());
+            log.warn("[Simulator] TIMEOUT mode — not publishing confirmation for elementId={}",
+                    command.getElementId());
             return;
         }
 
-        HlrConfirmationMessage confirmation = (mode == Mode.SUCCESS)
-                ? HlrConfirmationMessage.ok(
+        ElementConfirmationMessage confirmation = (mode == Mode.SUCCESS)
+                ? ElementConfirmationMessage.ok(
                         command.getCorrelationId(),
                         command.getWorkflowId(),
-                        command.getTargetCsp())
-                : HlrConfirmationMessage.error(
+                        command.getElementId(),
+                        command.getElementType(),
+                        command.getTargetProfile())
+                : ElementConfirmationMessage.error(
                         command.getCorrelationId(),
                         command.getWorkflowId(),
-                        "HLR_PROFILE_REJECTED",
-                        "Target CSP " + command.getTargetCsp() + " not provisioned for this IMSI");
+                        command.getElementId(),
+                        command.getElementType(),
+                        "ELEMENT_REJECTED",
+                        "Element " + command.getElementId() + " rejected profile " + command.getTargetProfile());
 
         bus.publishConfirmation(confirmation);
-        log.info("[Simulator] Published {} confirmation for correlationId={}",
-                mode, command.getCorrelationId());
+        log.info("[Simulator] Published {} confirmation: elementId={}, type={}",
+                mode, command.getElementId(), command.getElementType());
     }
 
     @Override

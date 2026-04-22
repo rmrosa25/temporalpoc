@@ -222,6 +222,7 @@ public class TestRunner {
                 correlationId,
                 "8931080019" + shortId().substring(0, 6),  // ICCID
                 "+1555" + shortId().substring(0, 7),        // MSISDN
+                "NET-EU-01",                                // networkId
                 "PROFILE_BASIC",
                 "PROFILE_DATA_ROAMING",
                 "operator-portal"

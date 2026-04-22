@@ -21,12 +21,10 @@ import java.util.UUID;
 import java.util.concurrent.Future;
 
 /**
- * Kafka-backed HLR message bus.
+ * Kafka-backed provisioning message bus.
  *
  * Used when KAFKA_BOOTSTRAP_SERVERS is set (Docker / external Kafka available).
- * Each instance creates its own producer and consumer pair.
- * Consumers use unique group IDs so every instance receives all messages
- * (fan-out semantics needed for the simulator and the confirmation consumer).
+ * Topics: provisioning-commands, provisioning-confirmations.
  */
 public class KafkaHlrBus implements HlrBus {
 
@@ -40,43 +38,45 @@ public class KafkaHlrBus implements HlrBus {
     public KafkaHlrBus(String bootstrapServers, String consumerGroupSuffix) {
         this.producer = buildProducer(bootstrapServers);
 
-        // Unique group per instance so simulator and worker each get all messages
-        String groupId = "hlr-bus-" + consumerGroupSuffix + "-" + UUID.randomUUID().toString().substring(0, 6);
+        String groupId = "prov-bus-" + consumerGroupSuffix + "-" + UUID.randomUUID().toString().substring(0, 6);
         this.commandConsumer      = buildConsumer(bootstrapServers, groupId + "-cmd");
         this.confirmationConsumer = buildConsumer(bootstrapServers, groupId + "-conf");
 
-        commandConsumer.subscribe(Collections.singletonList(KafkaConfig.HLR_COMMANDS_TOPIC));
-        confirmationConsumer.subscribe(Collections.singletonList(KafkaConfig.HLR_CONFIRMATIONS_TOPIC));
+        commandConsumer.subscribe(Collections.singletonList(KafkaConfig.PROVISIONING_COMMANDS_TOPIC));
+        confirmationConsumer.subscribe(Collections.singletonList(KafkaConfig.PROVISIONING_CONFIRMATIONS_TOPIC));
 
         log.info("KafkaHlrBus initialized: bootstrapServers={}", bootstrapServers);
     }
 
     @Override
-    public long publishCommand(HlrCommandMessage message) {
-        return publish(KafkaConfig.HLR_COMMANDS_TOPIC, message.getIccid(), message);
+    public long publishCommand(ProvisioningCommandMessage message) {
+        // Key by ICCID+elementId — ensures ordering per SIM per element
+        String key = message.getIccid() + ":" + message.getElementId();
+        return publish(KafkaConfig.PROVISIONING_COMMANDS_TOPIC, key, message);
     }
 
     @Override
-    public void publishConfirmation(HlrConfirmationMessage message) {
-        publish(KafkaConfig.HLR_CONFIRMATIONS_TOPIC, message.getCorrelationId(), message);
+    public void publishConfirmation(ElementConfirmationMessage message) {
+        String key = message.getCorrelationId() + ":" + message.getElementId();
+        publish(KafkaConfig.PROVISIONING_CONFIRMATIONS_TOPIC, key, message);
     }
 
     @Override
-    public HlrCommandMessage pollCommand(long timeoutMs) throws InterruptedException {
+    public ProvisioningCommandMessage pollCommand(long timeoutMs) throws InterruptedException {
         ConsumerRecords<String, String> records = commandConsumer.poll(Duration.ofMillis(timeoutMs));
         for (ConsumerRecord<String, String> r : records) {
             commandConsumer.commitSync();
-            return parse(r.value(), HlrCommandMessage.class);
+            return parse(r.value(), ProvisioningCommandMessage.class);
         }
         return null;
     }
 
     @Override
-    public HlrConfirmationMessage pollConfirmation(long timeoutMs) throws InterruptedException {
+    public ElementConfirmationMessage pollConfirmation(long timeoutMs) throws InterruptedException {
         ConsumerRecords<String, String> records = confirmationConsumer.poll(Duration.ofMillis(timeoutMs));
         for (ConsumerRecord<String, String> r : records) {
             confirmationConsumer.commitSync();
-            return parse(r.value(), HlrConfirmationMessage.class);
+            return parse(r.value(), ElementConfirmationMessage.class);
         }
         return null;
     }
@@ -88,8 +88,6 @@ public class KafkaHlrBus implements HlrBus {
         confirmationConsumer.close();
         log.info("KafkaHlrBus closed");
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private long publish(String topic, String key, Object payload) {
         try {

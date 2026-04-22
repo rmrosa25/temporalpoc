@@ -1,43 +1,43 @@
 package com.example.provisioning.kafka;
 
 /**
- * Abstraction over the HLR command/confirmation message channel.
+ * Abstraction over the provisioning command/confirmation message channel.
  *
  * Two implementations:
- *   - KafkaHlrBus      — real Kafka (used when KAFKA_BOOTSTRAP_SERVERS is set)
- *   - InProcessHlrBus  — BlockingQueue (used when no external Kafka is available)
+ *   - KafkaHlrBus     — real Kafka (used when KAFKA_BOOTSTRAP_SERVERS is set)
+ *   - InProcessHlrBus — BlockingQueue (used when no external Kafka is available)
  *
- * The bus carries messages in one direction:
- *   publish(HlrCommandMessage)       → hlr-commands channel
- *   subscribe(HlrConfirmationListener) → hlr-confirmations channel
- *
- * KafkaSimulator also uses the bus to read commands and write confirmations.
+ * Flow:
+ *   publishCommand(ProvisioningCommandMessage)   → provisioning-commands topic
+ *   pollCommand()                                ← consumed by ProvisioningSimulator
+ *   publishConfirmation(ElementConfirmationMessage) → provisioning-confirmations topic
+ *   pollConfirmation()                           ← consumed by HlrConfirmationDispatcher
+ *                                                   → signals CspChangeWorkflow
  */
 public interface HlrBus {
 
     /**
-     * Publishes an HLR command. Blocks until the message is durably enqueued.
+     * Publishes a provisioning command for one network element.
      * Returns an opaque offset/sequence number for logging.
      */
-    long publishCommand(HlrCommandMessage message);
+    long publishCommand(ProvisioningCommandMessage message);
 
     /**
-     * Publishes an HLR confirmation (used by KafkaSimulator / HLR gateway).
+     * Publishes a confirmation from a network element (used by ProvisioningSimulator).
      */
-    void publishConfirmation(HlrConfirmationMessage message);
+    void publishConfirmation(ElementConfirmationMessage message);
 
     /**
-     * Reads the next HLR command. Blocks up to {@code timeoutMs} milliseconds.
-     * Returns null if no message arrives within the timeout.
+     * Reads the next provisioning command. Blocks up to {@code timeoutMs} ms.
+     * Returns null on timeout.
      */
-    HlrCommandMessage pollCommand(long timeoutMs) throws InterruptedException;
+    ProvisioningCommandMessage pollCommand(long timeoutMs) throws InterruptedException;
 
     /**
-     * Reads the next HLR confirmation. Blocks up to {@code timeoutMs} milliseconds.
-     * Returns null if no message arrives within the timeout.
+     * Reads the next element confirmation. Blocks up to {@code timeoutMs} ms.
+     * Returns null on timeout.
      */
-    HlrConfirmationMessage pollConfirmation(long timeoutMs) throws InterruptedException;
+    ElementConfirmationMessage pollConfirmation(long timeoutMs) throws InterruptedException;
 
-    /** Releases resources. */
     void close();
 }

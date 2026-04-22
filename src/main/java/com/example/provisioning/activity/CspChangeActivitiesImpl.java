@@ -2,26 +2,34 @@ package com.example.provisioning.activity;
 
 import com.example.provisioning.kafka.HlrBus;
 import com.example.provisioning.kafka.HlrBusFactory;
-import com.example.provisioning.kafka.HlrCommandMessage;
+import com.example.provisioning.kafka.ProvisioningCommandMessage;
 import com.example.provisioning.model.CspChangeRequest;
+import com.example.provisioning.model.NetworkElement;
+import com.example.provisioning.model.NetworkElement.ElementType;
+import com.example.provisioning.model.ProvisioningPlan;
 import io.temporal.activity.Activity;
 import io.temporal.activity.ActivityExecutionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.UUID;
 
 /**
  * Activity implementations for the CSP change provisioning pipeline.
  *
- * publishHlrCommand writes to the {@link HlrBus} — either real Kafka or
- * the in-process bus, depending on environment configuration.
+ * Sync activities (validate, lockSim, decompose, updateSimInventory, rollbackLock)
+ * simulate calls to domain microservice APIs with realistic latency.
+ *
+ * provisioningCommand publishes one message per NetworkElement to the bus
+ * (Kafka in production, InProcessHlrBus in dev/test) and returns immediately.
  *
  * Failure injection via PROVISIONING_FAIL_AT env var:
- *   VALIDATE     → validateRequest throws
- *   LOCK         → lockSim throws
- *   HLR_PUBLISH  → publishHlrCommand throws (before bus write)
- *   INVENTORY    → updateSimInventory throws
+ *   VALIDATE    → validate throws
+ *   LOCK        → lockSim throws
+ *   DECOMPOSE   → decompose throws
+ *   PROVISION   → provisioningCommand throws (before any publish)
+ *   INVENTORY   → updateSimInventory throws
  */
 public class CspChangeActivitiesImpl implements CspChangeActivities {
 
@@ -30,97 +38,136 @@ public class CspChangeActivitiesImpl implements CspChangeActivities {
     private static final String FAIL_AT =
             System.getenv().getOrDefault("PROVISIONING_FAIL_AT", "NONE").toUpperCase();
 
+    // ── validate ──────────────────────────────────────────────────────────────
+
     @Override
-    public void validateRequest(CspChangeRequest request) {
-        log.info("[{}] Validating CSP change: iccid={}, {}→{}",
+    public void validate(CspChangeRequest request) {
+        log.info("[{}] → Validation Service: iccid={}, {}→{}",
                 request.getCorrelationId(), request.getIccid(),
                 request.getCurrentCsp(), request.getTargetCsp());
-        sleep(300);
+        sleep(300); // simulate API round-trip
 
         if ("VALIDATE".equals(FAIL_AT)) {
             throw Activity.wrap(new IllegalArgumentException(
-                    "Validation failed: ICCID " + request.getIccid() +
-                    " not found in SIM Inventory or CSP '" + request.getCurrentCsp() + "' mismatch"));
+                    "Validation Service rejected: ICCID " + request.getIccid() +
+                    " not found or CSP '" + request.getCurrentCsp() + "' mismatch"));
         }
 
-        log.info("[{}] Validation passed", request.getCorrelationId());
+        log.info("[{}] ← Validation Service: OK", request.getCorrelationId());
     }
+
+    // ── lockSim ───────────────────────────────────────────────────────────────
 
     @Override
     public String lockSim(CspChangeRequest request) {
-        log.info("[{}] Locking SIM iccid={} for exclusive change",
+        log.info("[{}] → SIM Inventory Service: lock iccid={}",
                 request.getCorrelationId(), request.getIccid());
         sleep(200);
 
         if ("LOCK".equals(FAIL_AT)) {
             throw Activity.wrap(new IllegalStateException(
-                    "Cannot lock SIM " + request.getIccid() +
-                    ": another provisioning operation is already in progress"));
+                    "SIM Inventory Service: iccid=" + request.getIccid() +
+                    " already locked by another operation"));
         }
 
         String lockToken = "LOCK-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-        log.info("[{}] SIM locked: token={}", request.getCorrelationId(), lockToken);
+        log.info("[{}] ← SIM Inventory Service: locked, token={}", request.getCorrelationId(), lockToken);
         return lockToken;
     }
 
+    // ── decompose ─────────────────────────────────────────────────────────────
+
     @Override
-    public void unlockSim(String lockToken) {
-        log.info("[COMPENSATION] Releasing SIM lock: token={}", lockToken);
-        sleep(200);
-        log.info("[COMPENSATION] SIM lock released: token={}", lockToken);
+    public ProvisioningPlan decompose(CspChangeRequest request) {
+        log.info("[{}] → Decomposition Service: iccid={}, targetCsp={}",
+                request.getCorrelationId(), request.getIccid(), request.getTargetCsp());
+        sleep(400); // decomposition may involve routing table lookups
+
+        if ("DECOMPOSE".equals(FAIL_AT)) {
+            throw Activity.wrap(new RuntimeException(
+                    "Decomposition Service unavailable for iccid=" + request.getIccid()));
+        }
+
+        // Stub: a real implementation would call the Decomposition microservice
+        // which resolves which HLR, MSC, SGSN nodes serve this ICCID/MSISDN
+        // and what profile code each element expects.
+        List<NetworkElement> elements = List.of(
+                new NetworkElement(ElementType.HLR,  "HLR-EU-01",  request.getNetworkId(), request.getTargetCsp()),
+                new NetworkElement(ElementType.MSC,  "MSC-EU-03",  request.getNetworkId(), "MSC-" + request.getTargetCsp()),
+                new NetworkElement(ElementType.SGSN, "SGSN-EU-07", request.getNetworkId(), "SGSN-" + request.getTargetCsp())
+        );
+
+        ProvisioningPlan plan = new ProvisioningPlan(
+                request.getCorrelationId(), request.getIccid(),
+                request.getTargetCsp(), elements);
+
+        log.info("[{}] ← Decomposition Service: {} elements — {}",
+                request.getCorrelationId(), elements.size(), elements);
+        return plan;
     }
 
-    @Override
-    public String publishHlrCommand(CspChangeRequest request) {
-        log.info("[{}] Publishing HLR command: iccid={}, targetCsp={}",
-                request.getCorrelationId(), request.getIccid(), request.getTargetCsp());
+    // ── provisioningCommand ───────────────────────────────────────────────────
 
-        if ("HLR_PUBLISH".equals(FAIL_AT)) {
+    @Override
+    public void provisioningCommand(ProvisioningPlan plan) {
+        log.info("[{}] Publishing {} provisioning commands to bus",
+                plan.getCorrelationId(), plan.getElements().size());
+
+        if ("PROVISION".equals(FAIL_AT)) {
             throw Activity.wrap(new RuntimeException(
-                    "Bus unavailable: failed to publish HLR command for " + request.getIccid()));
+                    "Bus unavailable: failed to publish provisioning commands for iccid=" + plan.getIccid()));
         }
 
         ActivityExecutionContext ctx = Activity.getExecutionContext();
         String workflowId = ctx.getInfo().getWorkflowId();
 
-        HlrCommandMessage message = new HlrCommandMessage(
-                request.getCorrelationId(),
-                workflowId,
-                request.getIccid(),
-                request.getMsisdn(),
-                request.getTargetCsp(),
-                request.getRequestedBy()
-        );
-
         HlrBus bus = HlrBusFactory.get();
-        long offset = bus.publishCommand(message);
-
-        String commandId = "HLR-CMD-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-        log.info("[{}] HLR command published: commandId={}, offset={}",
-                request.getCorrelationId(), commandId, offset);
-        return commandId;
+        for (NetworkElement element : plan.getElements()) {
+            ProvisioningCommandMessage msg = new ProvisioningCommandMessage(
+                    plan.getCorrelationId(),
+                    workflowId,
+                    plan.getIccid(),
+                    element.getElementId(),
+                    element.getElementType(),
+                    element.getNetworkId(),
+                    element.getTargetProfile()
+            );
+            long offset = bus.publishCommand(msg);
+            log.info("[{}] Command published: elementId={}, type={}, offset={}",
+                    plan.getCorrelationId(), element.getElementId(), element.getElementType(), offset);
+        }
     }
+
+    // ── updateSimInventory ────────────────────────────────────────────────────
 
     @Override
     public void updateSimInventory(CspChangeRequest request, String appliedCsp) {
-        log.info("[{}] Updating SIM Inventory: iccid={}, csp {} → {}",
+        log.info("[{}] → SIM Inventory Service: update iccid={}, csp {}→{} (also releases lock)",
                 request.getCorrelationId(), request.getIccid(),
                 request.getCurrentCsp(), appliedCsp);
         sleep(300);
 
         if ("INVENTORY".equals(FAIL_AT)) {
             throw Activity.wrap(new RuntimeException(
-                    "SIM Inventory DB write failed for iccid=" + request.getIccid()));
+                    "SIM Inventory Service write failed for iccid=" + request.getIccid()));
         }
 
-        log.info("[{}] SIM Inventory updated successfully", request.getCorrelationId());
+        log.info("[{}] ← SIM Inventory Service: updated and lock released", request.getCorrelationId());
     }
 
+    // ── rollbackLock (saga compensation) ──────────────────────────────────────
+
+    @Override
+    public void rollbackLock(String lockToken) {
+        log.info("[COMPENSATION] → SIM Inventory Service: rollback lock token={}", lockToken);
+        sleep(200);
+        log.info("[COMPENSATION] ← SIM Inventory Service: lock rolled back, token={}", lockToken);
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
     private void sleep(long ms) {
-        try {
-            Thread.sleep(ms);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        try { Thread.sleep(ms); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 }

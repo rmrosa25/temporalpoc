@@ -223,6 +223,7 @@ public class ScenarioRunner {
                 correlationId,
                 "8931080019" + shortId().substring(0, 6),
                 "+1555" + shortId().substring(0, 7),
+                "NET-EU-01",
                 "PROFILE_BASIC",
                 "PROFILE_DATA_ROAMING",
                 "operator-portal"
@@ -303,10 +304,10 @@ public class ScenarioRunner {
 
     private static String cspDescriptionFor(FailureMode mode) {
         switch (mode) {
-            case CSP_HAPPY_PATH:    return "validate → lock → publish command → HLR success signal → update inventory";
-            case CSP_VALIDATE_FAIL: return "Validation rejects request. No lock, no command published.";
-            case CSP_HLR_ERROR:     return "HLR returns error via signal. Saga: unlock SIM.";
-            case CSP_HLR_TIMEOUT:   return "No HLR signal within timeout. Saga: unlock SIM.";
+            case CSP_HAPPY_PATH:    return "validate → lockSim → decompose → provisioningCommand (HLR+MSC+SGSN) → all 3 signals → updateSimInventory";
+            case CSP_VALIDATE_FAIL: return "Validation Service rejects request. No lock, no decompose, no commands.";
+            case CSP_HLR_ERROR:     return "Network elements return error signals. Saga: rollbackLock.";
+            case CSP_HLR_TIMEOUT:   return "No element confirmations within timeout. Saga: rollbackLock.";
             default:                return mode.name();
         }
     }
