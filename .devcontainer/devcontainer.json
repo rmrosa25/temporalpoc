@@ -1,8 +1,15 @@
 {
   "name": "Temporal POC - Java",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
-  "forwardPorts": [7233, 8080, 8233],
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "vscode",
+  "forwardPorts": [7233, 8080, 8233, 5432, 9092],
   "portsAttributes": {
+    "5432": {
+      "label": "PostgreSQL",
+      "onAutoForward": "silent"
+    },
     "7233": {
       "label": "Temporal gRPC",
       "onAutoForward": "silent"
@@ -14,6 +21,34 @@
     "8233": {
       "label": "Temporal Metrics",
       "onAutoForward": "silent"
+    },
+    "9092": {
+      "label": "Kafka",
+      "onAutoForward": "silent"
     }
-  }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "21",
+      "installMaven": true,
+      "mavenVersion": "3.9.6"
+    },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "redhat.java",
+        "vscjava.vscode-maven",
+        "vscjava.vscode-spring-boot-dashboard",
+        "ms-azuretools.vscode-docker",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        "java.server.launchMode": "Standard"
+      }
+    }
+  },
+  "onCreateCommand": "apt-get update && apt-get install -y git build-essential",
+  "postCreateCommand": "mvn clean verify -DskipTests || true"
 }

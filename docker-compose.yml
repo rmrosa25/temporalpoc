@@ -66,3 +66,22 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
+
+  app:
+    image: mcr.microsoft.com/devcontainers/java:21-ubuntu-24.04
+    volumes:
+      - ..:/workspace:cached
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /workspace
+    command: /bin/sh -c "while sleep 1000; do :; done"
+    depends_on:
+      - postgresql
+      - temporal
+      - kafka
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+      - POSTGRES_HOST=postgresql
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+      - POSTGRES_DB=temporal
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
