@@ -1,4 +1,4 @@
-package com.example.order;
+package com.example;
 
 import com.example.order.activity.OrderActivitiesImpl;
 import com.example.order.workflow.BatchOrderWorkflowImpl;

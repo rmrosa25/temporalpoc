@@ -1,4 +1,4 @@
-package com.example.order;
+package com.example;
 
 import com.example.order.model.Order;
 import com.example.order.model.OrderResult;
