@@ -250,12 +250,13 @@ start_colima
 start_docker_stack
 build_if_needed
 
-run_scenario "NONE"
-run_scenario "INVALID_ORDER"
-run_scenario "PAYMENT_FAILURE"
-run_scenario "SHIPPING_FAILURE"
-run_scenario "PARENT_CHILD"
-run_scenario "BATCH"
+### Commented for now some scenarios out of Provisioning
+# run_scenario "NONE"
+# run_scenario "INVALID_ORDER"
+# run_scenario "PAYMENT_FAILURE"
+# run_scenario "SHIPPING_FAILURE"
+# run_scenario "PARENT_CHILD"
+# run_scenario "BATCH"
 run_scenario "CSP_HAPPY_PATH"
 run_scenario "CSP_VALIDATE_FAIL" "VALIDATE"
 run_scenario "CSP_HLR_ERROR"
