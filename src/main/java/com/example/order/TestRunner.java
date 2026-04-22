@@ -7,6 +7,10 @@ import com.example.order.model.OrderResult;
 import com.example.order.workflow.BatchOrderWorkflow;
 import com.example.order.workflow.FulfillmentWorkflow;
 import com.example.order.workflow.OrderWorkflow;
+import com.example.provisioning.model.CspChangeRequest;
+import com.example.provisioning.model.CspChangeResult;
+import com.example.provisioning.model.HlrConfirmation;
+import com.example.provisioning.workflow.CspChangeWorkflow;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.serviceclient.WorkflowServiceStubs;
@@ -17,17 +21,26 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Runs one test scenario per invocation, selected by FAILURE_MODE env var.
  *
- * Modes and what they exercise:
- *   NONE             → single OrderWorkflow, happy path
- *   INVALID_ORDER    → single OrderWorkflow, validation failure (no compensation)
- *   PAYMENT_FAILURE  → single OrderWorkflow, saga: release inventory
- *   SHIPPING_FAILURE → single OrderWorkflow, saga: refund + release inventory
- *   PARENT_CHILD     → FulfillmentWorkflow spawning 2 child OrderWorkflows
- *   BATCH            → BatchOrderWorkflow fanning out 10 parallel child OrderWorkflows
+ * Order pipeline:
+ *   NONE             → happy path
+ *   INVALID_ORDER    → validation failure, no compensation
+ *   PAYMENT_FAILURE  → saga: release inventory
+ *   SHIPPING_FAILURE → saga: refund + release inventory
+ *
+ * Workflow patterns:
+ *   PARENT_CHILD     → FulfillmentWorkflow with 2 sequential child workflows
+ *   BATCH            → BatchOrderWorkflow fanning out 10 parallel children
+ *
+ * CSP change provisioning:
+ *   CSP_HAPPY_PATH   → full success, HLR confirms via signal
+ *   CSP_VALIDATE_FAIL→ validation rejects before lock acquired
+ *   CSP_HLR_ERROR    → HLR returns error via signal, saga unlocks SIM
+ *   CSP_HLR_TIMEOUT  → no signal arrives, saga unlocks SIM
  *
  * Exits 0 on pass, 1 on fail.
  */
@@ -62,6 +75,12 @@ public class TestRunner {
             case BATCH:
                 pass = runBatch(client);
                 break;
+            case CSP_HAPPY_PATH:
+            case CSP_VALIDATE_FAIL:
+            case CSP_HLR_ERROR:
+            case CSP_HLR_TIMEOUT:
+                pass = runCspChange(client, mode);
+                break;
             default:
                 pass = runSingleOrder(client, mode);
         }
@@ -70,7 +89,7 @@ public class TestRunner {
         System.exit(pass ? 0 : 1);
     }
 
-    // ── Single order scenarios ────────────────────────────────────────────────
+    // ── Order pipeline ────────────────────────────────────────────────────────
 
     private static boolean runSingleOrder(WorkflowClient client, FailureMode mode) {
         Order order = orderForMode(mode);
@@ -98,22 +117,21 @@ public class TestRunner {
         return pass;
     }
 
-    // ── Parent / Child scenario ───────────────────────────────────────────────
+    // ── Parent / Child ────────────────────────────────────────────────────────
 
     private static boolean runParentChild(WorkflowClient client) {
         String parentId = "FULFILL-" + shortId();
-        Order primary   = new Order(newId(), "customer-10", "Laptop Pro X",    1, 2499.99);
+        Order primary   = new Order(newId(), "customer-10", "Laptop Pro X",     1, 2499.99);
         Order secondary = new Order(newId(), "customer-10", "Gift Wrap Add-on", 1,   19.99);
 
         String label = "Parent/Child Fulfillment";
         String desc  = "FulfillmentWorkflow (parent) spawns two child OrderWorkflows sequentially.\n" +
-                       "   Child 1: primary item order.\n" +
-                       "   Child 2: gift-wrap add-on (only if primary succeeds).";
+                       "   Child 1: primary item. Child 2: gift-wrap (only if primary succeeds).";
         printScenarioHeader(label, desc, "both children COMPLETED");
 
         log.info("Parent workflow ID: {}", parentId);
-        log.info("  Child 1 (primary)   → {}/primary   orderId={}", parentId, primary.getOrderId());
-        log.info("  Child 2 (secondary) → {}/secondary orderId={}", parentId, secondary.getOrderId());
+        log.info("  Child 1 → {}/primary   orderId={}", parentId, primary.getOrderId());
+        log.info("  Child 2 → {}/secondary orderId={}", parentId, secondary.getOrderId());
 
         WorkflowOptions opts = WorkflowOptions.newBuilder()
                 .setWorkflowId(parentId)
@@ -129,11 +147,9 @@ public class TestRunner {
 
         for (int i = 0; i < results.size(); i++) {
             OrderResult r = results.get(i);
-            String childLabel = (i == 0) ? "primary" : "secondary";
             log.info("  Child {} ({}) → status={}, message={}",
-                    i + 1, childLabel, r.getStatus(), r.getMessage());
+                    i + 1, i == 0 ? "primary" : "secondary", r.getStatus(), r.getMessage());
         }
-
         if (pass) {
             log.info("{}{}[PASS]{} {} → both children completed", BOLD, GREEN, RESET, label);
         } else {
@@ -142,7 +158,7 @@ public class TestRunner {
         return pass;
     }
 
-    // ── Batch scenario ────────────────────────────────────────────────────────
+    // ── Batch ─────────────────────────────────────────────────────────────────
 
     private static boolean runBatch(WorkflowClient client) {
         String batchId = "BATCH-" + shortId();
@@ -150,25 +166,19 @@ public class TestRunner {
 
         String label = "Batch Fan-out (" + batchSize + " parallel child workflows)";
         String desc  = "BatchOrderWorkflow fans out " + batchSize + " child OrderWorkflows in parallel\n" +
-                       "   using Async.function() + Promise.allOf(). All children run concurrently.\n" +
-                       "   Parent waits for all to finish, then aggregates results.";
+                       "   using Async.function() + Promise.allOf(). Aggregates results.";
         printScenarioHeader(label, desc, "all " + batchSize + " children COMPLETED");
 
-        List<Order> orders = new ArrayList<>();
         String[] items = {
             "Laptop Pro X", "Wireless Headphones", "Mechanical Keyboard",
             "USB-C Hub",    "Webcam HD",           "Monitor Stand",
             "Mouse Pad XL", "LED Desk Lamp",       "Cable Organizer",
             "Laptop Sleeve"
         };
+        List<Order> orders = new ArrayList<>();
         for (int i = 0; i < batchSize; i++) {
-            orders.add(new Order(
-                    newId(),
-                    "customer-" + String.format("%02d", i + 1),
-                    items[i],
-                    1,
-                    Math.round((29.99 + i * 15.5) * 100.0) / 100.0
-            ));
+            orders.add(new Order(newId(), "customer-" + String.format("%02d", i + 1),
+                    items[i], 1, Math.round((29.99 + i * 15.5) * 100.0) / 100.0));
         }
 
         log.info("Batch ID: {} — spawning {} child workflows in parallel", batchId, batchSize);
@@ -182,12 +192,10 @@ public class TestRunner {
         BatchResult result = wf.processBatch(orders);
 
         boolean pass = result.getCompleted() == batchSize && result.getFailed() == 0;
-
         log.info("Batch result: total={}, completed={}, failed={}",
                 result.getTotal(), result.getCompleted(), result.getFailed());
-        for (OrderResult r : result.getResults()) {
-            log.info("  {} → status={}", r.getOrderId(), r.getStatus());
-        }
+        result.getResults().forEach(r ->
+                log.info("  {} → status={}", r.getOrderId(), r.getStatus()));
 
         if (pass) {
             log.info("{}{}[PASS]{} {} → {}/{} completed",
@@ -199,20 +207,149 @@ public class TestRunner {
         return pass;
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── CSP Change provisioning ───────────────────────────────────────────────
+
+    private static boolean runCspChange(WorkflowClient client, FailureMode mode) {
+        String correlationId = "CSP-" + shortId();
+        CspChangeRequest request = new CspChangeRequest(
+                correlationId,
+                "8931080019" + shortId().substring(0, 6),  // ICCID
+                "+1555" + shortId().substring(0, 7),        // MSISDN
+                "PROFILE_BASIC",
+                "PROFILE_DATA_ROAMING",
+                "operator-portal"
+        );
+
+        String label       = cspLabelFor(mode);
+        String description = cspDescriptionFor(mode);
+        String expected    = (mode == FailureMode.CSP_HAPPY_PATH) ? "COMPLETED" : "FAILED or TIMED_OUT";
+
+        printScenarioHeader(label, description, expected);
+        log.info("correlationId={}, iccid={}, {}→{}",
+                request.getCorrelationId(), request.getIccid(),
+                request.getCurrentCsp(), request.getTargetCsp());
+
+        WorkflowOptions opts = WorkflowOptions.newBuilder()
+                .setWorkflowId(correlationId)
+                .setTaskQueue(Worker.TASK_QUEUE)
+                .build();
+
+        CspChangeWorkflow wfStub = client.newWorkflowStub(CspChangeWorkflow.class, opts);
+
+        // CSP_VALIDATE_FAIL: workflow will fail synchronously in the activity —
+        // no signal needed, just call synchronously.
+        if (mode == FailureMode.CSP_VALIDATE_FAIL) {
+            CspChangeResult result = wfStub.changeCsp(request);
+            boolean pass = result.getStatus() == CspChangeResult.Status.FAILED;
+            logCspResult(pass, label, result);
+            return pass;
+        }
+
+        // CSP_HLR_TIMEOUT: start workflow and send NO signal — let it time out.
+        // The workflow timeout is 30s; we just wait for it to return.
+        if (mode == FailureMode.CSP_HLR_TIMEOUT) {
+            log.info("No HLR signal will be sent — waiting for workflow timeout...");
+            CspChangeResult result = wfStub.changeCsp(request);
+            boolean pass = result.getStatus() == CspChangeResult.Status.TIMED_OUT;
+            logCspResult(pass, label, result);
+            return pass;
+        }
+
+        // CSP_HAPPY_PATH / CSP_HLR_ERROR:
+        // Start workflow asynchronously, then send the signal from a background thread.
+        CompletableFuture<CspChangeResult> future = WorkflowClient.execute(wfStub::changeCsp, request);
+
+        // Send the signal after a short delay (simulates Kafka consumer latency)
+        Thread signalThread = new Thread(() -> {
+            try {
+                Thread.sleep(2000); // simulate HLR processing time
+                CspChangeWorkflow signalStub = client.newWorkflowStub(
+                        CspChangeWorkflow.class, correlationId);
+
+                if (mode == FailureMode.CSP_HAPPY_PATH) {
+                    HlrConfirmation confirmation = HlrConfirmation.ok(
+                            correlationId, request.getTargetCsp());
+                    log.info("[signal-sender] Sending HLR success confirmation: {}", confirmation);
+                    signalStub.hlrConfirmationReceived(confirmation);
+                } else { // CSP_HLR_ERROR
+                    HlrConfirmation confirmation = HlrConfirmation.error(
+                            correlationId, "HLR_PROFILE_REJECTED",
+                            "Target CSP PROFILE_DATA_ROAMING not provisioned for this IMSI");
+                    log.info("[signal-sender] Sending HLR error confirmation: {}", confirmation);
+                    signalStub.hlrConfirmationReceived(confirmation);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                log.error("[signal-sender] Failed to send signal: {}", e.getMessage());
+            }
+        });
+        signalThread.setDaemon(true);
+        signalThread.start();
+
+        try {
+            CspChangeResult result = future.get();
+            boolean pass = (mode == FailureMode.CSP_HAPPY_PATH)
+                    ? result.getStatus() == CspChangeResult.Status.COMPLETED
+                    : result.getStatus() == CspChangeResult.Status.FAILED;
+            logCspResult(pass, label, result);
+            return pass;
+        } catch (Exception e) {
+            log.error("{}{}[FAIL]{} {} → exception: {}", BOLD, RED, RESET, label, e.getMessage());
+            return false;
+        }
+    }
+
+    private static void logCspResult(boolean pass, String label, CspChangeResult result) {
+        if (pass) {
+            log.info("{}{}[PASS]{} {} → status={}, detail={}",
+                    BOLD, GREEN, RESET, label, result.getStatus(), result);
+        } else {
+            log.error("{}{}[FAIL]{} {} → status={}, detail={}",
+                    BOLD, RED, RESET, label, result.getStatus(), result);
+        }
+    }
+
+    // ── CSP label / description helpers ──────────────────────────────────────
+
+    private static String cspLabelFor(FailureMode mode) {
+        switch (mode) {
+            case CSP_HAPPY_PATH:    return "CSP Change — Happy Path";
+            case CSP_VALIDATE_FAIL: return "CSP Change — Validation Failure";
+            case CSP_HLR_ERROR:     return "CSP Change — HLR Error (saga: unlock SIM)";
+            case CSP_HLR_TIMEOUT:   return "CSP Change — HLR Timeout (saga: unlock SIM)";
+            default:                return mode.name();
+        }
+    }
+
+    private static String cspDescriptionFor(FailureMode mode) {
+        switch (mode) {
+            case CSP_HAPPY_PATH:
+                return "Full pipeline: validate → lock SIM → publish HLR command →\n" +
+                       "   receive HLR success signal → update SIM Inventory.";
+            case CSP_VALIDATE_FAIL:
+                return "Validation rejects the request (SIM not found / CSP mismatch).\n" +
+                       "   No lock acquired, no Kafka message published.";
+            case CSP_HLR_ERROR:
+                return "HLR returns an explicit error via signal after command is published.\n" +
+                       "   Saga compensates: unlocks SIM. Inventory not updated.";
+            case CSP_HLR_TIMEOUT:
+                return "No HLR confirmation signal arrives within the timeout window.\n" +
+                       "   Saga compensates: unlocks SIM. Inventory not updated.";
+            default:
+                return mode.name();
+        }
+    }
+
+    // ── Order helpers ─────────────────────────────────────────────────────────
 
     private static Order orderForMode(FailureMode mode) {
         switch (mode) {
-            case NONE:
-                return new Order(newId(), "customer-01", "Laptop Pro X",        2, 2499.99);
-            case INVALID_ORDER:
-                return new Order(newId(), "customer-02", "Unknown Gadget Z",     1,   99.99);
-            case PAYMENT_FAILURE:
-                return new Order(newId(), "customer-03", "Wireless Headphones",  1,  349.99);
-            case SHIPPING_FAILURE:
-                return new Order(newId(), "customer-04", "Mechanical Keyboard",  3,  189.99);
-            default:
-                throw new IllegalArgumentException("No single-order mapping for mode: " + mode);
+            case NONE:             return new Order(newId(), "customer-01", "Laptop Pro X",       2, 2499.99);
+            case INVALID_ORDER:    return new Order(newId(), "customer-02", "Unknown Gadget Z",    1,   99.99);
+            case PAYMENT_FAILURE:  return new Order(newId(), "customer-03", "Wireless Headphones", 1,  349.99);
+            case SHIPPING_FAILURE: return new Order(newId(), "customer-04", "Mechanical Keyboard", 3,  189.99);
+            default: throw new IllegalArgumentException("No order mapping for mode: " + mode);
         }
     }
 

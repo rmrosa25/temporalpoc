@@ -4,6 +4,8 @@ import com.example.order.activity.OrderActivitiesImpl;
 import com.example.order.workflow.BatchOrderWorkflowImpl;
 import com.example.order.workflow.FulfillmentWorkflowImpl;
 import com.example.order.workflow.OrderWorkflowImpl;
+import com.example.provisioning.activity.CspChangeActivitiesImpl;
+import com.example.provisioning.workflow.CspChangeWorkflowImpl;
 import io.temporal.client.WorkflowClient;
 import io.temporal.serviceclient.WorkflowServiceStubs;
 import io.temporal.serviceclient.WorkflowServiceStubsOptions;
@@ -19,6 +21,7 @@ import org.slf4j.LoggerFactory;
  *   - OrderWorkflow        — single order pipeline (saga pattern)
  *   - FulfillmentWorkflow  — parent/child: primary + secondary order
  *   - BatchOrderWorkflow   — fan-out: N parallel child OrderWorkflows
+ *   - CspChangeWorkflow    — network provisioning: signal-driven HLR change
  */
 public class Worker {
 
@@ -42,9 +45,13 @@ public class Worker {
         worker.registerWorkflowImplementationTypes(
                 OrderWorkflowImpl.class,
                 FulfillmentWorkflowImpl.class,
-                BatchOrderWorkflowImpl.class
+                BatchOrderWorkflowImpl.class,
+                CspChangeWorkflowImpl.class
         );
-        worker.registerActivitiesImplementations(new OrderActivitiesImpl());
+        worker.registerActivitiesImplementations(
+                new OrderActivitiesImpl(),
+                new CspChangeActivitiesImpl()
+        );
 
         log.info("Worker started. Polling task queue: {}", TASK_QUEUE);
         factory.start();

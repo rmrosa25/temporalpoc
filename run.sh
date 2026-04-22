@@ -82,15 +82,16 @@ wait_for_port() {
 # ── Worker lifecycle ──────────────────────────────────────────────────────────
 start_worker() {
   local mode="${1:-NONE}"
+  local prov_fail="${2:-NONE}"
   pkill -f "com.example.order.Worker" 2>/dev/null || true
   sleep 1
-  info "Starting worker with FAILURE_MODE=${mode}..."
-  nohup env FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.Worker \
-    > "$WORKER_LOG" 2>&1 &
+  info "Starting worker with FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}..."
+  nohup env FAILURE_MODE="$mode" PROVISIONING_FAIL_AT="$prov_fail" \
+    java -cp "$JAR" com.example.order.Worker > "$WORKER_LOG" 2>&1 &
   sleep 3
   grep -q "Worker started" "$WORKER_LOG" \
-    || error "Worker failed to start (FAILURE_MODE=${mode}). Check: $WORKER_LOG"
-  success "Worker started | FAILURE_MODE=${mode}"
+    || error "Worker failed to start. Check: $WORKER_LOG"
+  success "Worker started | FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}"
 }
 
 stop_worker() {
@@ -138,15 +139,16 @@ show_status() {
 }
 
 # ── Run one scenario group ────────────────────────────────────────────────────
-# Restarts the worker with the given FAILURE_MODE, runs TestRunner, captures exit code.
+# $1 = FAILURE_MODE   $2 = PROVISIONING_FAIL_AT (optional, default NONE)
 SUITE_FAILURES=0
 run_scenario_group() {
   local mode="$1"
+  local prov_fail="${2:-NONE}"
   echo ""
   echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${BOLD}${YELLOW}  Worker mode: FAILURE_MODE=${mode}${NC}"
+  echo -e "${BOLD}${YELLOW}  Worker mode: FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}${NC}"
   echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  start_worker "$mode"
+  start_worker "$mode" "$prov_fail"
   FAILURE_MODE="$mode" java -cp "$JAR" com.example.order.TestRunner || ((SUITE_FAILURES++))
   stop_worker
 }
@@ -170,13 +172,18 @@ check_deps
 build_if_needed
 ensure_server
 
-# Run all 6 scenario groups, one per FAILURE_MODE
+# Run all 10 scenario groups
 run_scenario_group "NONE"
 run_scenario_group "INVALID_ORDER"
 run_scenario_group "PAYMENT_FAILURE"
 run_scenario_group "SHIPPING_FAILURE"
 run_scenario_group "PARENT_CHILD"
 run_scenario_group "BATCH"
+# CSP change provisioning scenarios — worker uses PROVISIONING_FAIL_AT
+run_scenario_group "CSP_HAPPY_PATH"
+run_scenario_group "CSP_VALIDATE_FAIL" "VALIDATE"
+run_scenario_group "CSP_HLR_ERROR"
+run_scenario_group "CSP_HLR_TIMEOUT"
 
 stop_worker
 
@@ -185,7 +192,7 @@ echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━
 echo -e "${BOLD}${CYAN}  Suite Summary${NC}"
 echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 if [[ "$SUITE_FAILURES" -eq 0 ]]; then
-  echo -e "  ${GREEN}${BOLD}All 6 scenarios passed.${NC}"
+  echo -e "  ${GREEN}${BOLD}All 10 scenarios passed.${NC}"
 else
   echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed. Check worker logs: ${WORKER_LOG}${NC}"
 fi

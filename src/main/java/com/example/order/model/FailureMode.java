@@ -5,10 +5,19 @@ package com.example.order.model;
  * Passed via the FAILURE_MODE environment variable on the worker.
  */
 public enum FailureMode {
+    // Order pipeline scenarios
     NONE,
-    INVALID_ORDER,    // validation rejects before any mutation
-    PAYMENT_FAILURE,  // payment fails → release inventory
-    SHIPPING_FAILURE, // shipping fails → refund payment + release inventory
-    PARENT_CHILD,     // no failure — exercises parent/child workflow pattern
-    BATCH             // no failure — exercises batch fan-out of 10 child workflows
+    INVALID_ORDER,
+    PAYMENT_FAILURE,
+    SHIPPING_FAILURE,
+
+    // Workflow pattern scenarios (no failure injection)
+    PARENT_CHILD,
+    BATCH,
+
+    // CSP change provisioning scenarios
+    CSP_HAPPY_PATH,       // full success: HLR confirms OK
+    CSP_VALIDATE_FAIL,    // validation rejects the request
+    CSP_HLR_ERROR,        // HLR returns explicit error via signal
+    CSP_HLR_TIMEOUT       // no HLR signal arrives within timeout
 }
