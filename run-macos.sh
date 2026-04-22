@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
 # Temporal Order Processing POC — macOS runner
 #
-# Usage:
-#   ./run-macos.sh           — install deps, start stack, run all 4 test scenarios
-#   ./run-macos.sh --stop    — stop worker + Docker stack + Colima
-#   ./run-macos.sh --status  — show running processes and log paths
+# Uses Temporal CLI dev server (no Docker required).
+# Each scenario runs in a single JVM (ScenarioRunner) that starts the
+# Temporal worker and the test together, sharing an in-process message bus.
 #
-# Dependencies installed automatically:
-#   Homebrew, SDKMAN, Java 21 (via SDKMAN), Maven (via SDKMAN),
-#   Colima, Docker CLI, Docker Compose plugin, Temporal CLI
+# Usage:
+#   ./run-macos.sh           — install deps, build, run all 10 scenarios
+#   ./run-macos.sh --stop    — stop Temporal dev server
+#   ./run-macos.sh --status  — show running processes
 
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-JAVA_VERSION="21.0.5-tem"          # Temurin 21 via SDKMAN
-TEMPORAL_CLI_VERSION="1.6.2"       # https://github.com/temporalio/cli/releases
+JAVA_VERSION="21.0.5-tem"
+TEMPORAL_CLI_VERSION="1.6.2"
 JAR="target/temporal-order-poc-1.0-SNAPSHOT.jar"
 TEMPORAL_PORT=7233
-UI_PORT=8080
-KAFKA_PORT=9092
-KAFKA_BOOTSTRAP="localhost:${KAFKA_PORT}"
-WORKER_LOG="/tmp/temporal-worker.log"
-COLIMA_CPUS=2
-COLIMA_MEMORY=4   # GiB — Temporal + Postgres + Kafka need ~3 GiB
+UI_PORT=8233
+TEMPORAL_LOG="/tmp/temporal-server.log"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
@@ -38,30 +34,19 @@ install_homebrew() {
     info "Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   fi
-  # Apple Silicon path
-  if [[ -f /opt/homebrew/bin/brew ]]; then
-    eval "$(/opt/homebrew/bin/brew shellenv)"
-    grep -q "homebrew" "${HOME}/.zprofile" 2>/dev/null || \
-      echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "${HOME}/.zprofile"
-  fi
+  [[ -f /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
   success "Homebrew $(brew --version | head -1)"
 }
 
-# ── SDKMAN helpers ────────────────────────────────────────────────────────────
-# SDKMAN's scripts use unguarded variables (ZSH_VERSION, SDKMAN_OFFLINE_MODE,
-# etc.) throughout — not just in the init script. Keep -u disabled for the
-# entire SDKMAN session and restore it only after all sdk commands finish.
+# ── SDKMAN ────────────────────────────────────────────────────────────────────
+# SDKMAN uses unguarded variables throughout — keep -u off for all sdk calls.
 sdkman_init() {
   export SDKMAN_DIR="${HOME}/.sdkman"
   set +u
   # shellcheck disable=SC1091
   source "${SDKMAN_DIR}/bin/sdkman-init.sh"
-  # -u stays off; caller must call sdkman_done when finished
 }
-
-sdkman_done() {
-  set -u
-}
+sdkman_done() { set -u; }
 
 install_sdkman() {
   if [[ ! -f "${HOME}/.sdkman/bin/sdkman-init.sh" ]]; then
@@ -69,13 +54,10 @@ install_sdkman() {
     curl -s "https://get.sdkman.io" | bash
   fi
   sdkman_init
-  local ver
-  ver=$(sdk version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  success "SDKMAN $(sdk version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
   sdkman_done
-  success "SDKMAN ${ver}"
 }
 
-# ── Java 21 via SDKMAN ────────────────────────────────────────────────────────
 install_java() {
   sdkman_init
   if ! sdk list java 2>/dev/null | grep -q "${JAVA_VERSION}.*installed\|${JAVA_VERSION}.*current"; then
@@ -87,7 +69,6 @@ install_java() {
   success "Java $(java -version 2>&1 | head -1)"
 }
 
-# ── Maven via SDKMAN ──────────────────────────────────────────────────────────
 install_maven() {
   sdkman_init
   if ! command -v mvn &>/dev/null; then
@@ -95,200 +76,104 @@ install_maven() {
     sdk install maven < /dev/null
   fi
   sdkman_done
-  success "Maven $(mvn -version 2>&1 | head -1)"
-}
-
-# ── Colima + Docker CLI + Compose plugin ─────────────────────────────────────
-install_colima_docker() {
-  if ! command -v colima &>/dev/null; then
-    info "Installing Colima..."
-    brew install colima
-  fi
-  if ! command -v docker &>/dev/null; then
-    info "Installing Docker CLI..."
-    brew install docker
-  fi
-  # Docker Compose as a CLI plugin
-  if ! docker compose version &>/dev/null 2>&1; then
-    info "Installing Docker Compose plugin..."
-    brew install docker-compose
-    mkdir -p "${HOME}/.docker/cli-plugins"
-    ln -sfn "$(brew --prefix docker-compose)/bin/docker-compose" \
-        "${HOME}/.docker/cli-plugins/docker-compose"
-  fi
-  success "Colima  $(colima version 2>/dev/null | head -1)"
-  success "Docker  $(docker --version)"
-  success "Compose $(docker compose version)"
+  success "Maven $(mvn -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 }
 
 # ── Temporal CLI ──────────────────────────────────────────────────────────────
 install_temporal_cli() {
   local installed_ver=""
-  if command -v temporal &>/dev/null; then
+  command -v temporal &>/dev/null && \
     installed_ver=$(temporal --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-  fi
 
   if [[ "$installed_ver" != "$TEMPORAL_CLI_VERSION" ]]; then
-    info "Installing Temporal CLI v${TEMPORAL_CLI_VERSION} via Homebrew..."
-    # Unlink any existing version first to avoid conflicts
-    brew unlink temporal 2>/dev/null || true
-    brew install temporal
-    # If brew ships a different version, fall back to the official install script
-    local brew_ver
-    brew_ver=$(temporal --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    if [[ "$brew_ver" != "$TEMPORAL_CLI_VERSION" ]]; then
-      warn "Homebrew has v${brew_ver}, installing v${TEMPORAL_CLI_VERSION} via install script..."
-      curl -sSf https://temporal.download/cli.sh | TEMPORAL_CLI_VERSION="$TEMPORAL_CLI_VERSION" sh
-      export PATH="${HOME}/.temporalio/bin:$PATH"
-      grep -q ".temporalio/bin" "${HOME}/.zshrc" 2>/dev/null || \
-        echo 'export PATH="${HOME}/.temporalio/bin:$PATH"' >> "${HOME}/.zshrc"
-    fi
+    info "Installing Temporal CLI v${TEMPORAL_CLI_VERSION}..."
+    curl -sSf https://temporal.download/cli.sh | TEMPORAL_CLI_VERSION="$TEMPORAL_CLI_VERSION" sh
+    export PATH="${HOME}/.temporalio/bin:$PATH"
+    grep -q ".temporalio/bin" "${HOME}/.zshrc" 2>/dev/null || \
+      echo 'export PATH="${HOME}/.temporalio/bin:$PATH"' >> "${HOME}/.zshrc"
   fi
-  success "Temporal CLI $(temporal --version 2>&1 | head -1)"
-}
-
-# ── Start Colima ──────────────────────────────────────────────────────────────
-start_colima() {
-  if colima status 2>/dev/null | grep -q "Running"; then
-    success "Colima already running"
-  else
-    info "Starting Colima (${COLIMA_CPUS} CPUs, ${COLIMA_MEMORY}GiB RAM)..."
-    colima start --cpu "$COLIMA_CPUS" --memory "$COLIMA_MEMORY" --disk 20
-    success "Colima started"
-  fi
-  export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
-}
-
-# ── Start Docker Compose stack ────────────────────────────────────────────────
-start_docker_stack() {
-  export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
-
-  if docker compose ps --services --filter "status=running" 2>/dev/null | grep -q "temporal-ui"; then
-    success "Docker stack already running"
-    return
-  fi
-
-  info "Starting Docker stack (PostgreSQL + Temporal server + UI)..."
-  docker compose up -d
-
-  info "Waiting for Temporal UI on port ${UI_PORT}..."
-  local attempts=0 max=60
-  until curl -sf "http://localhost:${UI_PORT}" &>/dev/null; do
-    ((attempts++))
-    [[ $attempts -ge $max ]] && error "Temporal UI did not start within ${max}s. Run: docker compose logs"
-    sleep 2
-  done
-  success "Temporal stack ready | UI → http://localhost:${UI_PORT}"
-
-  info "Waiting for Kafka on port ${KAFKA_PORT}..."
-  attempts=0
-  until (echo > /dev/tcp/localhost/${KAFKA_PORT}) &>/dev/null; do
-    ((attempts++))
-    [[ $attempts -ge $max ]] && error "Kafka did not start within ${max}s. Run: docker compose logs kafka"
-    sleep 2
-  done
-  success "Kafka ready | bootstrap=localhost:${KAFKA_PORT}"
+  export PATH="${HOME}/.temporalio/bin:$PATH"
+  success "Temporal CLI $(temporal --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 }
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 build_if_needed() {
   local needs_build=false
-  if [[ ! -f "$JAR" ]]; then
-    needs_build=true
-  elif find src -name "*.java" -newer "$JAR" | grep -q .; then
-    info "Source files changed — rebuilding..."
-    needs_build=true
-  fi
-
+  [[ ! -f "$JAR" ]] && needs_build=true
+  find src -name "*.java" -newer "$JAR" 2>/dev/null | grep -q . && needs_build=true
   if [[ "$needs_build" == "true" ]]; then
+    info "Building..."
     mvn package -q -DskipTests
-    success "Build complete → $JAR"
+    success "Build complete → $(du -sh "$JAR" | cut -f1) JAR"
   else
     info "JAR is up to date."
   fi
 }
 
-# ── Stop everything ───────────────────────────────────────────────────────────
-stop_all() {
-  info "Stopping worker..."
-  pkill -f "com.example.order.Worker" 2>/dev/null && success "Worker stopped" || warn "Worker was not running"
-
-  export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
-  info "Stopping Docker stack..."
-  docker compose down && success "Docker stack stopped" || warn "Docker stack was not running"
-
-  info "Stopping Colima..."
-  colima stop && success "Colima stopped" || warn "Colima was not running"
+# ── Temporal dev server ───────────────────────────────────────────────────────
+start_temporal() {
+  export PATH="${HOME}/.temporalio/bin:$PATH"
+  if nc -z localhost "$TEMPORAL_PORT" 2>/dev/null; then
+    success "Temporal dev server already running on :${TEMPORAL_PORT}"
+    return
+  fi
+  info "Starting Temporal dev server (port=${TEMPORAL_PORT}, UI=${UI_PORT})..."
+  temporal server start-dev \
+    --port "$TEMPORAL_PORT" \
+    --ui-port "$UI_PORT" \
+    --headless \
+    > "$TEMPORAL_LOG" 2>&1 &
+  local attempts=0
+  until nc -z localhost "$TEMPORAL_PORT" 2>/dev/null; do
+    ((attempts++))
+    [[ $attempts -ge 30 ]] && error "Temporal dev server did not start. Check: $TEMPORAL_LOG"
+    sleep 1
+  done
+  success "Temporal dev server ready | UI → http://localhost:${UI_PORT}"
 }
 
-# ── Status ────────────────────────────────────────────────────────────────────
+stop_temporal() {
+  pkill -f "temporal server start-dev" 2>/dev/null || true
+  sleep 1
+  success "Temporal dev server stopped"
+}
+
 show_status() {
   echo ""
-  echo -e "${CYAN}=== Colima ===${NC}"
-  colima status 2>/dev/null || echo "  not running"
-
-  echo ""
-  echo -e "${CYAN}=== Docker containers ===${NC}"
-  export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
-  docker compose ps 2>/dev/null || echo "  stack not running"
-
-  echo ""
-  echo -e "${CYAN}=== Worker ===${NC}"
-  if pgrep -f "com.example.order.Worker" &>/dev/null; then
-    echo -e "  ${GREEN}RUNNING${NC} (PID $(pgrep -f 'com.example.order.Worker'))"
-  else
-    echo -e "  ${RED}STOPPED${NC}"
-  fi
-
+  echo -e "${CYAN}=== Temporal dev server ===${NC}"
+  pgrep -f "temporal server start-dev" &>/dev/null \
+    && echo -e "  ${GREEN}RUNNING${NC} (PID $(pgrep -f 'temporal server start-dev'))" \
+    || echo -e "  ${RED}STOPPED${NC}"
   echo ""
   echo -e "${CYAN}=== Logs ===${NC}"
-  echo "  Worker:       $WORKER_LOG"
-  echo "  Docker stack: docker compose logs"
+  echo "  Temporal: $TEMPORAL_LOG"
   echo ""
 }
 
-# ── Worker lifecycle ──────────────────────────────────────────────────────────
-start_worker() {
-  local mode="${1:-NONE}"
-  local prov_fail="${2:-NONE}"
-  pkill -f "com.example.order.Worker" 2>/dev/null || true
-  sleep 1
-  info "Starting worker with FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}..."
-  nohup env \
-    FAILURE_MODE="$mode" \
-    PROVISIONING_FAIL_AT="$prov_fail" \
-    KAFKA_BOOTSTRAP_SERVERS="$KAFKA_BOOTSTRAP" \
-    java -cp "$JAR" com.example.order.Worker > "$WORKER_LOG" 2>&1 &
-  sleep 3
-  grep -q "Worker started" "$WORKER_LOG" \
-    || error "Worker failed to start. Check: $WORKER_LOG"
-  success "Worker started | FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}"
-}
-
-stop_worker() {
-  pkill -f "com.example.order.Worker" 2>/dev/null || true
-  sleep 1
-}
-
-# ── Run one scenario group ────────────────────────────────────────────────────
+# ── Run one scenario ──────────────────────────────────────────────────────────
 SUITE_FAILURES=0
-run_scenario_group() {
-  local mode="$1"
-  local prov_fail="${2:-NONE}"
+run_scenario() {
+  local mode="$1" prov_fail="${2:-NONE}"
   echo ""
   echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${BOLD}${YELLOW}  Worker mode: FAILURE_MODE=${mode} PROVISIONING_FAIL_AT=${prov_fail}${NC}"
+  echo -e "${BOLD}${YELLOW}  FAILURE_MODE=${mode}  PROVISIONING_FAIL_AT=${prov_fail}${NC}"
   echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  start_worker "$mode" "$prov_fail"
-  FAILURE_MODE="$mode" KAFKA_BOOTSTRAP_SERVERS="$KAFKA_BOOTSTRAP" \
-    java -cp "$JAR" com.example.order.TestRunner || ((SUITE_FAILURES++))
-  stop_worker
+
+  local log_file="/tmp/scenario-${mode}.log"
+  if FAILURE_MODE="$mode" PROVISIONING_FAIL_AT="$prov_fail" \
+       java -cp "$JAR" com.example.order.ScenarioRunner > "$log_file" 2>&1; then
+    success "PASS — ${mode}"
+  else
+    warn "FAIL — ${mode} (log: ${log_file})"
+    tail -20 "$log_file"
+    ((SUITE_FAILURES++))
+  fi
 }
 
 # ── Argument handling ─────────────────────────────────────────────────────────
 case "${1:-}" in
-  --stop)   stop_all;    exit 0 ;;
-  --status) show_status; exit 0 ;;
+  --stop)   stop_temporal; exit 0 ;;
+  --status) show_status;   exit 0 ;;
   "")       ;;
   *) echo "Usage: $0 [--stop | --status]"; exit 1 ;;
 esac
@@ -297,36 +182,28 @@ esac
 echo ""
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}${BOLD}║   Temporal Order Processing POC          ║${NC}"
-echo -e "${CYAN}${BOLD}║   macOS  ·  Colima  ·  SDKMAN            ║${NC}"
+echo -e "${CYAN}${BOLD}║   macOS · Temporal CLI · In-Process Bus  ║${NC}"
 echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
 install_homebrew
-install_sdkman   # also calls sdkman_source, making sdk/java available
+install_sdkman
 install_java
 install_maven
-install_colima_docker
 install_temporal_cli
-
-start_colima
-export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
-start_docker_stack
 build_if_needed
+start_temporal
 
-# Run all 10 scenario groups
-run_scenario_group "NONE"
-run_scenario_group "INVALID_ORDER"
-run_scenario_group "PAYMENT_FAILURE"
-run_scenario_group "SHIPPING_FAILURE"
-run_scenario_group "PARENT_CHILD"
-run_scenario_group "BATCH"
-# CSP change provisioning scenarios
-run_scenario_group "CSP_HAPPY_PATH"
-run_scenario_group "CSP_VALIDATE_FAIL" "VALIDATE"
-run_scenario_group "CSP_HLR_ERROR"
-run_scenario_group "CSP_HLR_TIMEOUT"
-
-stop_worker
+run_scenario "NONE"
+run_scenario "INVALID_ORDER"
+run_scenario "PAYMENT_FAILURE"
+run_scenario "SHIPPING_FAILURE"
+run_scenario "PARENT_CHILD"
+run_scenario "BATCH"
+run_scenario "CSP_HAPPY_PATH"
+run_scenario "CSP_VALIDATE_FAIL" "VALIDATE"
+run_scenario "CSP_HLR_ERROR"
+run_scenario "CSP_HLR_TIMEOUT"
 
 echo ""
 echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -335,11 +212,11 @@ echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━
 if [[ "$SUITE_FAILURES" -eq 0 ]]; then
   echo -e "  ${GREEN}${BOLD}All 10 scenarios passed.${NC}"
 else
-  echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed. Check worker logs: ${WORKER_LOG}${NC}"
+  echo -e "  ${RED}${BOLD}${SUITE_FAILURES} scenario(s) failed.${NC}"
+  echo -e "  Scenario logs: ${YELLOW}/tmp/scenario-*.log${NC}"
 fi
 echo ""
-echo -e "  Temporal UI  → ${GREEN}http://localhost:${UI_PORT}${NC}"
-echo -e "  Stop all     → ${YELLOW}./run-macos.sh --stop${NC}"
-echo -e "  Status       → ${YELLOW}./run-macos.sh --status${NC}"
+echo -e "  Temporal UI → ${GREEN}http://localhost:${UI_PORT}${NC}"
+echo -e "  Stop server → ${YELLOW}./run-macos.sh --stop${NC}"
 echo ""
 exit "$SUITE_FAILURES"
