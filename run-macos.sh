@@ -214,7 +214,7 @@ run_scenario() {
 
   local log_file="/tmp/scenario-${mode}.log"
   if FAILURE_MODE="$mode" PROVISIONING_FAIL_AT="$prov_fail" \
-       java -cp "$JAR" com.example.ScenarioRunner > "$log_file" 2>&1; then
+       java -cp "$JAR" -Dloader.main=com.example.ScenarioRunner org.springframework.boot.loader.launch.PropertiesLauncher > "$log_file" 2>&1; then
     success "PASS — ${mode}"
   else
     warn "FAIL — ${mode} (log: ${log_file})"

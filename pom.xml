@@ -40,13 +40,20 @@
 
     <build>
         <plugins>
+            <!-- Spring Boot executable JAR → temporal-order-poc-1.0-SNAPSHOT.jar
+                 Used by: java -jar (REST API + worker) -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
                     <mainClass>com.example.TemporalPocApplication</mainClass>
+                    <!-- PropertiesLauncher allows overriding the main class at runtime
+                         via -Dloader.main=com.example.ScenarioRunner, used by run.sh -->
+                    <layout>ZIP</layout>
                 </configuration>
             </plugin>
+
+
         </plugins>
     </build>
 </project>
